@@ -1,0 +1,116 @@
+### MLS reporting endpoint
+curl -X POST http://127.0.0.1:8080/api/mls/v2/geosubmit
+-H "Content-Type: application/json"
+-d 
+'{
+  "items": [
+    {
+      "timestamp": 1759107257,
+      "position": {
+            "latitude": 55.716106,
+            "longitude": 37.895653,
+            "accuracy": 10.0
+        },
+      "wifiAccessPoints": [
+        {
+            "macAddress": "74:fe:ce:d3:6d:01",
+            "signalStrength": -82
+        },
+        {
+            "macAddress": "76:fe:ce:23:6d:01",
+            "signalStrength": -78
+        }
+      ]
+    }
+  ]
+}'
+
+### MLS geolocation endpoint
+curl -X POST http://127.0.0.1:8080/api/mls/v1/geolocate 
+-H "Content-Type: application/json"
+-d 
+'{
+  "wifiAccessPoints": [
+    {
+        "macAddress": "74:fe:ce:d3:6d:01",
+        "signalStrength": -81
+    },
+    {
+        "macAddress": "76:fe:ce:23:6d:01",
+        "signalStrength": -79
+    }
+  ]
+}'
+
+### public reporting endpoint
+curl -X POST http://127.0.0.1:8080/api/v1/report
+-H "Content-Type: application/json"
+-H "Authorization: Bearer SECRET-TOKEN" 
+-d 
+'{
+  "items": [
+    {
+      "timestamp": 1759107257,
+      "gnss": {
+            "latitude": 55.716106,
+            "longitude": 37.895653,
+            "accuracy": 10.0
+        },
+      "wifi": [
+        {
+            "mac": "74:fe:ce:d3:6d:01",
+            "rssi": -82
+        },
+        {
+            "mac": "76:fe:ce:23:6d:01",
+            "rssi": -78
+        }
+      ]
+    }
+  ]
+}'
+
+### public geolocation endpoint
+curl -X POST http://127.0.0.1:8080/api/v1/locate 
+-H "Content-Type: application/json" 
+-H "Authorization: Bearer SECRET-TOKEN" 
+-d 
+'{
+  "wifi": [
+    {
+        "mac": "74:fe:ce:d3:6d:01",
+        "rssi": -81
+    },
+    {
+        "mac": "76:fe:ce:23:6d:01"
+    }
+  ]
+}'
+
+### 
+curl -X POST "http://10.0.1.122:3000/api/v1/locate"
+-H "Content-Type: application/json"
+-H "Authorization: Bearer SECRET-TOKEN"
+-d 
+'{
+  "wifi": [{
+      "mac": "dc:f8:b9:81:c2:ba",
+      "rssi": -75
+  },
+  {
+      "mac": "bc:fd:0c:5a:30:35",
+      "rssi": -83
+  },
+  {
+      "mac": "08:9a:c7:e9:4b:82",
+      "rssi": -79
+  },
+  {
+      "mac": "d4:60:e3:1a:1f:31",
+      "rssi": -75
+  },
+  {
+      "mac": "50:ff:20:c1:a0:74",
+      "rssi": -80
+  }]
+}'

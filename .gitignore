@@ -1,0 +1,13 @@
+/.sqlx
+/.vscode
+/target
+/scripts
+docs/*.txt
+docs/*.http
+!docs/4cell-example.http
+!docs/wigle-example.http
+.env
+config.toml
+stats.json
+sqlx
+t38_config.json

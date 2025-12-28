@@ -1,0 +1,15 @@
+<gpx version="1.1">
+    <trk>
+        <trkseg>
+            <trkpt lat="55.705196" lon="37.513812"></trkpt>
+            <trkpt lat="55.701120" lon="37.514915"></trkpt>
+            <trkpt lat="55.698138" lon="37.512110"></trkpt>
+            <trkpt lat="55.694828" lon="37.510222"></trkpt>
+            <trkpt lat="55.693344" lon="37.505321"></trkpt>
+            <trkpt lat="55.690889" lon="37.503048"></trkpt>
+            <trkpt lat="55.691454" lon="37.499989"></trkpt>
+            <trkpt lat="55.690005" lon="37.498538"></trkpt>
+            <trkpt lat="55.689557" lon="37.496130"></trkpt>
+        </trkseg>
+    </trk>
+</gpx>
