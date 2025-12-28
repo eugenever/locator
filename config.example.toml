@@ -45,19 +45,7 @@ instances = [
 enabled = false
 url = "https://locator.api.maps.yandex.ru/v1/locate?apikey="
 api_keys = [
-    "b9da27e2-8440-4561-8a09-c0c9781410a1",
-    "e6e1e16a-e5f1-4db4-afc9-d622f21530d6",
-    "36d4b423-a401-4b72-878d-a22ebfc0e4a0",
-    "b23b0737-3a71-48d8-a2d5-db72c0c6634c",
-    "3cf34204-7b2d-4ae6-bd2d-fdb398071b9c",
-    "2946aaad-5ea9-47bc-af4a-369b17c1b409",
-    "82b0687f-8090-4a47-b64f-e78dac728881",
-    "250439fe-d5ef-4272-91cb-d8204aee64a3",
-    "508ee197-e0ac-4366-96a6-d57c582f9cbd",
-    "aa31c5c9-d8f5-4b38-b006-1a5a674a5616",
-    "65f78936-2ae4-4f68-80d5-098df9f5c448",
-    "9f34a8fb-b012-43e1-9e37-ecba87aa18cd",
-    "a765ec4f-7902-4719-aa32-b48888126980"
+    "b9da27e2-8440-4561-8a09-c0c9781410a1"
 ]
 rate_limit = 10 # maximum number of simultaneous requests
 max_distance_in_cluster = 500
