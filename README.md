@@ -8,7 +8,8 @@
 
 ## Комментарии к коду
 
-- [работа с ин-мемори хранилищем на базе Tile38](https://github.com/eugenever/locator/tree/main/src/db/t38)
+- [работа с in-memory хранилищем на базе Tile38](https://github.com/eugenever/locator/tree/main/src/db/t38)
+- [управление кластером Tile38, включая кастомный failover (без внешнего Sentinel процесса)](https://github.com/eugenever/locator/tree/main/src/tasks/t38)
 - [взаимодействие с внешними Location-Based Services](https://github.com/eugenever/locator/tree/main/src/lbs)
 - [обработка запросов с измерениями от самокатов](https://github.com/eugenever/locator/tree/main/src/services/submission)
 - [взаимодействие с внешним Routing Engine GraphHopper](https://github.com/eugenever/locator/tree/main/src/services/routing)
