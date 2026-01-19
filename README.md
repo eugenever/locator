@@ -6,6 +6,15 @@
 
 Важным требованием проекта является поддержка высокого значения RPS (несколько десятков тысяч).
 
+## Комментарии к коду
+
+- [работа с ин-мемори хранилищем на базе Tile38](https://github.com/eugenever/locator/tree/main/src/db/t38)
+- [взаимодействие с внешними Location-Based Services](https://github.com/eugenever/locator/tree/main/src/lbs)
+- [обработка запросов с измерениями от самокатов](https://github.com/eugenever/locator/tree/main/src/services/submission)
+- [взаимодействие с внешним Routing Engine GraphHopper](https://github.com/eugenever/locator/tree/main/src/services/routing)
+- [обработка запросов локализации самокатов](https://github.com/eugenever/locator/tree/main/src/services/locate)
+
+
 ## Сбор измерений
 
 Может осуществляться непосредственно с устройств или через приложение [NeoStumbler](https://github.com/mjaakko/NeoStumbler).

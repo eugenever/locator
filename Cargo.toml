@@ -66,3 +66,7 @@ unsafe_code = "forbid"
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
