@@ -12,24 +12,38 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CONFIG,
     config::Config,
-    constants::{Collection, HOUR, MAX_DISTANCE, MAX_SCOOTER_SPEED},
-    db::t38::{
-        cmd::REDIS_NO_DATA, get_wifi_many_from_pipeline, get_yandex_lbs_wifi_one,
-        set_yandex_lbs_wifi_one, track::WifiTrack,
+    constants::{
+        Collection, DEFAULT_RSSI, FALLBACK_EPSILON_CLUSTER, FALLBACK_LOCATE_DISTANCE, HOUR,
+        MAX_DISTANCE, MAX_SCOOTER_SPEED, SIGNAL_DROP_COEFFICIENT,
+    },
+    db::{
+        blobasaur::get_ba_limiter,
+        t38::{
+            REDIS_NO_DATA, get_wifi_many_from_pipeline, get_yandex_lbs_wifi_missing_one,
+            get_yandex_lbs_wifi_one, set_yandex_lbs_wifi_one, track::WifiTrack,
+        },
     },
     error::ApiError,
+    lbs::http_client::HttpClient,
     services::{
-        locate::dbscan::{Algorithm, DBSCAN, Point, create_cell_points},
+        geolocate_public::LocationResponsePublic,
+        locate::dbscan::{Algorithm, DBSCAN, Point, create_cell_points, distance_factor_cell},
         rate_limiter::RateLimitersApp,
     },
     tasks::{
+        blobasaur::BAConnectionManageMessage,
         t38::T38ConnectionManageMessage,
         yandex::{InvalidApiKey, YandexApiMessage},
     },
 };
 
+use super::{COUNT_ATTEMPTS, TIMEOUT};
+
 pub static YANDEX_LBS_URL: Lazy<String> = Lazy::new(|| {
-    let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, CONFIG.yandex_lbs.api_keys[0]);
+    let yandex_lbs_url = format!(
+        "{}{}",
+        CONFIG.yandex_lbs.url, CONFIG.yandex_lbs.api_keys[0].key
+    );
     yandex_lbs_url
 });
 
@@ -37,6 +51,12 @@ macro_rules! not_convertible_error {
     ($v:expr, $det:expr) => {
         ParsingError::from(format!("{:?} (response was {:?})", $det, $v))
     };
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct YandexWifiMissing {
+    pub mac: String,
+    pub ts: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,10 +91,10 @@ impl FromRedisValue for YandexData {
 
     fn from_redis_value(v: redis::Value) -> Result<YandexData, ParsingError> {
         // Tile38 pipe sends an empty string when there is no data
-        if let redis::Value::BulkString(ref bulk_string) = v {
-            if bulk_string.len() == 0 {
-                return Err(ParsingError::from(REDIS_NO_DATA));
-            }
+        if let redis::Value::BulkString(ref bulk_string) = v
+            && bulk_string.is_empty()
+        {
+            return Err(ParsingError::from(REDIS_NO_DATA));
         }
 
         // discard first element bulk-string('"{\"type\":\"Point\",\"coordinates\":[55.68643406911036,37.900367606988134]}"'),
@@ -96,7 +116,7 @@ impl FromRedisValue for YandexData {
                 let data = match fields_it.next() {
                     Some(data_value) => match data_value {
                         Value::BulkString(ylr_bytes) => {
-                            match serde_json::from_slice::<YandexLbsResponse>(&ylr_bytes) {
+                            match serde_json::from_slice::<YandexLbsResponse>(ylr_bytes) {
                                 Err(e) => {
                                     error!("deserialize YandexLbsResponse from BulkString: {}", e);
                                     Err(not_convertible_error!(
@@ -202,7 +222,10 @@ pub async fn yandex_lbs_request(
     config: &Config,
     wms: Vec<WifiMeasurement>,
 ) -> Result<YandexLbsResponse, anyhow::Error> {
-    let yandex_lbs_url = format!("{}{}", config.yandex_lbs.url, config.yandex_lbs.api_keys[0]);
+    let yandex_lbs_url = format!(
+        "{}{}",
+        config.yandex_lbs.url, config.yandex_lbs.api_keys[0].key
+    );
     let yandex_lbs_request = YandexLbsRequest { wifi: wms };
     let yandex_lbs_response: YandexLbsResponse = reqwest::Client::new()
         .post(yandex_lbs_url)
@@ -214,11 +237,34 @@ pub async fn yandex_lbs_request(
     Ok(yandex_lbs_response)
 }
 
+pub async fn yandex_lbs_cache_wifi(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    wms: &[WifiMeasurement],
+) -> Result<HashMap<String, Option<YandexLbsResponse>>, ApiError> {
+    let mut lbs_cache: HashMap<String, Option<YandexLbsResponse>> =
+        HashMap::with_capacity(wms.len());
+    let collection = Collection::LbsYandexWifi.as_ref();
+    for wm in wms {
+        let mac = wm.bssid.clone();
+        match get_yandex_lbs_wifi_one(tx_t38_conn.clone(), collection, &wm.bssid).await {
+            Err(_e) => {
+                lbs_cache.insert(mac.clone(), None);
+            }
+            Ok(ylr_opt) => {
+                if ylr_opt.is_some() {
+                    lbs_cache.insert(mac.clone(), ylr_opt);
+                }
+            }
+        }
+    }
+    Ok(lbs_cache)
+}
+
 pub async fn yandex_lbs_request_by_individual_wifi(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    _config: &Config,
-    wms: Vec<WifiMeasurement>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    wms: &[WifiMeasurement],
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<HashMap<String, Option<YandexLbsResponse>>, ApiError> {
@@ -226,6 +272,7 @@ pub async fn yandex_lbs_request_by_individual_wifi(
         HashMap::with_capacity(wms.len());
 
     let collection = Collection::LbsYandexWifi.as_ref();
+    let tz_moscow = chrono_tz::Europe::Moscow;
 
     for wm in wms {
         let mac = wm.bssid.clone();
@@ -233,17 +280,30 @@ pub async fn yandex_lbs_request_by_individual_wifi(
         match get_yandex_lbs_wifi_one(tx_t38_conn.clone(), collection, &wm.bssid).await {
             Err(_e) => {
                 // don`t repeat the request in Yandex LBS
-                lbs_responses.insert(mac, None);
+                lbs_responses.insert(mac.clone(), None);
                 continue;
             }
             Ok(ylr_opt) => {
                 if ylr_opt.is_some() {
                     // retrieve a previously saved Yandex response from the database
-                    lbs_responses.insert(mac, ylr_opt);
+                    lbs_responses.insert(mac.clone(), ylr_opt);
                     continue;
                 }
                 // in case of None make a request to Yandex LBS
             }
+        }
+
+        // if wifi was previously requested in Yandex and is not available, then skip it
+        if let Ok(Some(_ywm)) = get_yandex_lbs_wifi_missing_one(
+            tx_t38_conn.clone(),
+            Collection::LbsYandexWifiMissing.as_ref(),
+            &wm.bssid,
+        )
+        .await
+        {
+            lbs_responses.insert(mac, None);
+            // don`t repeat the request in Yandex LBS
+            continue;
         }
 
         /*
@@ -252,7 +312,9 @@ pub async fn yandex_lbs_request_by_individual_wifi(
             continue;
         */
 
-        let yandex_lbs_request = YandexLbsRequest { wifi: vec![wm] };
+        let yandex_lbs_request = YandexLbsRequest {
+            wifi: vec![wm.clone()],
+        };
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let yandex_api_message = YandexApiMessage::GetApiKey { tx };
@@ -264,102 +326,56 @@ pub async fn yandex_lbs_request_by_individual_wifi(
         }
 
         if let Ok(Some(api_key)) = rx.await {
-            let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key);
+            if let Ok(limiter) = get_ba_limiter(tx_ba_conn.clone(), &api_key.key.key).await {
+                // DEBUG
+                // TODO: remove after tests by Whoosh
+                info!(
+                    "key {}, limiter: {}, limit: {}",
+                    api_key.key.key, limiter, api_key.key.limit
+                );
+
+                if limiter >= api_key.key.limit - CONFIG.yandex_lbs.reserve_limiter {
+                    // block the current API key
+                    let created_date = chrono::Utc::now().with_timezone(&tz_moscow).date_naive();
+                    let yandex_api_message_invalid_key = YandexApiMessage::InvalidApiKey {
+                        invalid_api_key: InvalidApiKey {
+                            _error: Some(format!("StatusCode {}", 403)),
+                            i: api_key.i,
+                            key: api_key.key,
+                            created_date,
+                        },
+                    };
+                    if let Err(e) = tx_yandex_api
+                        .send_async(yandex_api_message_invalid_key)
+                        .await
+                    {
+                        error!("send yandex api invalid key message: {}", e);
+                    }
+                    return Err(ApiError::LbsError(403));
+                }
+            }
+
+            let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key.key);
 
             // Acquire permit before processing request
             // Permit released automatically when the handler is completed
             let _permit = rl_app.yandex_lbs.acquire().await;
 
-            let count_attempts = 5;
-            let mut attempt = 0;
-            while attempt <= count_attempts {
-                attempt = attempt + 1;
-
-                match yandex_client
-                    .post(&yandex_lbs_url)
-                    .json(&yandex_lbs_request)
-                    .send()
-                    .await
-                {
-                    Err(e) => {
-                        // undefined request error
-                        error!("Yandex LBS request for MAC '{}': {}", mac.clone(), e);
-                        return Err(ApiError::LbsRequestError());
-                    }
-                    Ok(response) => {
-                        // 400, 403, 429, 500, 504
-                        let status = response.status().as_u16();
-                        if status != 200 {
-                            // repeat the request in Yandex LBS
-                            if status == 429 || status == 500 || status == 504 {
-                                if attempt == count_attempts {
-                                    return Err(ApiError::LbsError(status));
-                                }
-                                info!("mac: {}, status: {}, attempt: {}", &mac, status, attempt);
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                            if status == 403 {
-                                info!("Yandex: number of requests has been exceeded");
-                                let yandex_api_message_invalid_key =
-                                    YandexApiMessage::InvalidApiKey {
-                                        invalid_api_key: InvalidApiKey {
-                                            error: Some(format!("StatusCode {}", status)),
-                                            i: api_key.i,
-                                            key: api_key.key,
-                                        },
-                                    };
-                                if let Err(e) = tx_yandex_api
-                                    .send_async(yandex_api_message_invalid_key)
-                                    .await
-                                {
-                                    error!("send yandex api invalid key message: {}", e);
-                                }
-                            }
-                            info!("MAC: {}, Yandex response status: {}", mac, status);
-                            return Err(ApiError::LbsError(status));
-                        }
-
-                        match response.json::<serde_json::Value>().await {
-                            Err(e) => {
-                                error!("deserialize Yandex LBS response: {}", e);
-                                lbs_responses.insert(mac.clone(), None);
-                            }
-                            Ok(value) => {
-                                // successful response
-                                if let serde_json::Value::Object(ref object) = value {
-                                    if object.is_empty() {
-                                        // no data available for the requested access point
-                                        lbs_responses.insert(mac.clone(), None);
-                                        // exit from while loop
-                                        break;
-                                    }
-                                }
-
-                                if let Ok(yandex_lbs_response) =
-                                    serde_json::from_value::<YandexLbsResponse>(value)
-                                {
-                                    let ylr = yandex_lbs_response.clone();
-                                    lbs_responses.insert(mac.clone(), Some(ylr));
-
-                                    // save Yandex LBS response in our database
-                                    if let Err(e) = set_yandex_lbs_wifi_one(
-                                        tx_t38_conn.clone(),
-                                        collection,
-                                        yandex_lbs_response,
-                                        &mac,
-                                    )
-                                    .await
-                                    {
-                                        error!("save Yandex LBS response: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        // exit from while loop
-                        break;
-                    }
-                }
+            if let Err(e) = yandex_client
+                .post_for_data(
+                    &mac,
+                    &yandex_lbs_url,
+                    &yandex_lbs_request,
+                    tx_yandex_api.clone(),
+                    api_key,
+                    &mut lbs_responses,
+                    tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
+                    collection,
+                )
+                .await
+            {
+                return Err(e);
             }
         } else {
             return Err(ApiError::LbsError(403));
@@ -395,10 +411,12 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
             yandex_data_filter = yandex_data_vec
                 .into_iter()
                 .filter(|yd| yd.is_some())
-                .flat_map(|yd| yd)
+                .flatten()
                 .collect::<Vec<_>>();
         }
     }
+
+    let tz_moscow = chrono_tz::Europe::Moscow;
 
     for wm in wms {
         if let Some(yd) = yandex_data_filter.iter().find(|&yd| yd.mac == wm.bssid) {
@@ -417,12 +435,11 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
             }
 
             if let Ok(Some(api_key)) = rx.await {
-                let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key);
+                let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key.key);
 
-                let count_attempts = 5;
                 let mut attempt = 0;
-                while attempt <= count_attempts {
-                    attempt = attempt + 1;
+                while attempt <= COUNT_ATTEMPTS {
+                    attempt += 1;
 
                     match yandex_client
                         .post(&yandex_lbs_url)
@@ -435,11 +452,14 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
                             error!("Yandex LBS request for MAC '{}': {}", &mac, e);
                             lbs_responses.insert(mac.clone(), None);
 
+                            let created_date =
+                                chrono::Utc::now().with_timezone(&tz_moscow).date_naive();
                             let yandex_api_message_invalid_key = YandexApiMessage::InvalidApiKey {
                                 invalid_api_key: InvalidApiKey {
-                                    error: Some(e.to_string()),
+                                    _error: Some(e.to_string()),
                                     i: api_key.i,
                                     key: api_key.key.clone(),
+                                    created_date,
                                 },
                             };
                             if let Err(e) = tx_yandex_api
@@ -455,24 +475,27 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
                             if status != 200 {
                                 // repeat the request in Yandex LBS
                                 if status == 429 || status == 500 || status == 504 {
-                                    if attempt == count_attempts {
+                                    if attempt == COUNT_ATTEMPTS {
                                         return Err(ApiError::LbsError(status));
                                     }
                                     info!(
                                         "mac: {}, status: {}, attempt: {}",
                                         &mac, status, attempt
                                     );
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    tokio::time::sleep(Duration::from_millis(TIMEOUT)).await;
                                     continue;
                                 }
                                 if status == 403 {
                                     info!("Yandex: number of requests has been exceeded");
+                                    let created_date =
+                                        chrono::Utc::now().with_timezone(&tz_moscow).date_naive();
                                     let yandex_api_message_invalid_key =
                                         YandexApiMessage::InvalidApiKey {
                                             invalid_api_key: InvalidApiKey {
-                                                error: Some(format!("StatusCode {}", status)),
+                                                _error: Some(format!("StatusCode {}", status)),
                                                 i: api_key.i,
                                                 key: api_key.key,
+                                                created_date,
                                             },
                                         };
                                     if let Err(e) = tx_yandex_api
@@ -494,12 +517,12 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
                                 }
                                 Ok(value) => {
                                     // successful response
-                                    if let serde_json::Value::Object(ref object) = value {
-                                        if object.is_empty() {
-                                            // no data available for the requested access point
-                                            lbs_responses.insert(mac.clone(), None);
-                                            continue;
-                                        }
+                                    if let serde_json::Value::Object(ref object) = value
+                                        && object.is_empty()
+                                    {
+                                        // no data available for the requested access point
+                                        lbs_responses.insert(mac.clone(), None);
+                                        continue;
                                     }
 
                                     if let Ok(yandex_lbs_response) =
@@ -512,7 +535,7 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
                                         if let Err(e) = set_yandex_lbs_wifi_one(
                                             tx_t38_conn.clone(),
                                             collection,
-                                            yandex_lbs_response,
+                                            &yandex_lbs_response,
                                             &mac,
                                         )
                                         .await
@@ -538,7 +561,104 @@ pub async fn yandex_lbs_request_by_individual_wifi_pipe(
 
 #[derive(Debug, Clone)]
 pub struct OutliersYandex {
-    pub outliers: HashMap<String, YandexLbsResponse>,
+    pub data: HashMap<String, YandexLbsResponse>,
+}
+
+impl OutliersYandex {
+    pub fn outliers(&self) -> &HashMap<String, YandexLbsResponse> {
+        &self.data
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn try_estimate_location(
+        &self,
+        cell_opt: Option<HashMap<String, Option<YandexLbsResponse>>>,
+        wms: &[WifiMeasurement],
+    ) -> Option<LocationResponsePublic> {
+        // greater than 1 provides additional assurance that the points are not outliers
+        if let Some(cell) = cell_opt
+            && self.len() > 1
+        {
+            let cell_points = create_cell_points(&cell);
+
+            // use fallback only if there is Cell
+            if !cell_points.is_empty() {
+                let cap = self.len();
+                let mut points: Vec<Point> = Vec::with_capacity(cap);
+                let mut macs: Vec<&str> = Vec::with_capacity(cap);
+
+                self.data.iter().enumerate().for_each(|(i, (mac, ylr))| {
+                    points.push(Point {
+                        id: i as u32,
+                        lat: ylr.location.point.lat,
+                        lon: ylr.location.point.lon,
+                    });
+                    macs.push(mac);
+                });
+
+                let mut discarded_by_cell_points = Vec::new();
+                let mut filtered_by_cell_points = Vec::new();
+
+                points.iter().for_each(|p| {
+                    let distance_point_cell = p.distance(&cell_points[0]);
+                    // for emissions we use FALLBACK_LOCATE_DISTANCE
+                    if distance_point_cell > FALLBACK_LOCATE_DISTANCE {
+                        discarded_by_cell_points.push(*p);
+                    } else {
+                        filtered_by_cell_points.push(*p);
+                    }
+                });
+                let fp_len = filtered_by_cell_points.len();
+                // only if there are points inside the specified zone
+                if fp_len > 0 {
+                    let actual_clusters = if fp_len == 1 {
+                        vec![filtered_by_cell_points]
+                    } else {
+                        let algorithm = DBSCAN::new(FALLBACK_EPSILON_CLUSTER, 0);
+                        let clusters = algorithm.cluster(&filtered_by_cell_points);
+                        clusters.clusters()
+                    };
+                    if !actual_clusters.is_empty() {
+                        let mut main_cluster_id = 0;
+                        let mut main_cluster_len = 0;
+                        for (i, cluster) in actual_clusters.iter().enumerate() {
+                            let cl = cluster.len();
+                            if cl > main_cluster_len {
+                                main_cluster_id = i;
+                                main_cluster_len = cl;
+                            }
+                        }
+
+                        if let Some(main_cluster) = actual_clusters.get(main_cluster_id) {
+                            let mut yandex_lbs_responses = HashMap::with_capacity(main_cluster_len);
+                            main_cluster.iter().for_each(|p| {
+                                if let Some(&mac) = macs.get(p.id as usize)
+                                    && let Some(ylr) = self.data.get(mac)
+                                {
+                                    yandex_lbs_responses.insert(mac.to_string(), Some(ylr.clone()));
+                                }
+                            });
+
+                            if let Some(estimated_yandex_lbs_response) =
+                                estimate_location_by_yandex_responses(&yandex_lbs_responses, wms)
+                            {
+                                let location_response = LocationResponsePublic::new(
+                                    estimated_yandex_lbs_response.location.point.lat,
+                                    estimated_yandex_lbs_response.location.point.lon,
+                                    estimated_yandex_lbs_response.location.accuracy,
+                                );
+                                return Some(location_response);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 pub fn detect_yandex_outliers(
@@ -553,6 +673,7 @@ pub fn detect_yandex_outliers(
 
     let cell = cell_opt.unwrap_or_default();
     let cell_points = create_cell_points(&cell);
+    let dfc = distance_factor_cell(&cell);
 
     let cap = ylrs_filtered.len();
     let mut points: Vec<Point> = Vec::with_capacity(cap);
@@ -573,82 +694,156 @@ pub fn detect_yandex_outliers(
         });
 
     if ylrs_filtered.len() == 1 {
-        if cell_points.len() > 0 {
+        if !cell_points.is_empty() {
             let distance_point_cell = points[0].distance(&cell_points[0]);
-            if distance_point_cell > CONFIG.locator.max_distance_cell {
+            if distance_point_cell > CONFIG.locator.max_distance_cell * dfc {
                 let mut outliers = HashMap::with_capacity(1);
                 macs.iter().for_each(|&mac| {
-                    if let Some(ylr_opt) = yandex_lbs_responses.get(mac) {
-                        if let Some(ylr) = ylr_opt {
-                            outliers.insert(mac.to_string(), ylr.clone());
-                        }
+                    if let Some(Some(ylr)) = yandex_lbs_responses.get(mac) {
+                        outliers.insert(mac.to_string(), ylr.clone());
                     }
                 });
-                return Some(OutliersYandex { outliers });
+                return Some(OutliersYandex { data: outliers });
             }
         }
         return None;
     }
 
+    // TODO:
+    /*
+        // A case where two points are equivalent, both in the BS zone, but not clustered, the distance between them is 700 m
+        [2026-02-08T07:56:31Z INFO  locator::services::locate::geolocate_public] wifi: [{"bssid":"50:0f:f5:05:98:21","signal_strength":-77.0},{"bssid":"c0:e3:50:77:60:30","signal_strength":-72.0},{"bssid":"bc:fd:0c:aa:b4:7d","signal_strength":-77.0},{"bssid":"e4:6f:13:db:a3:60","signal_strength":-75.0},{"bssid":"24:a4:3c:7a:c3:0b","signal_strength":-76.0}]
+        [2026-02-08T07:56:31Z INFO  locator::services::locate::geolocate_public] cell: {"gsm":[{"mcc":250,"mnc":1,"lac":12394,"ci":115837974,"rxlev":-67.0,"age":null,"bsic":null,"arfcn":null,"ta":null}]}
+        [2026-02-08T07:56:31Z WARN  locator::tasks::yandex] Date: 08-02-2026, requests in YL: 4720
+        [2026-02-08T07:56:31Z WARN  locator::tasks::yandex] Date: 08-02-2026, requests in YL: 4721
+        [2026-02-08T07:56:31Z INFO  locator::services::locate::geolocate_public] Locate: {"location":{"latitude":45.097519,"longitude":38.990868},"accuracy":64}
+        [2026-02-08T07:56:31Z INFO  actix_web::middleware::logger] 10.0.1.100 "POST /api/v1/locate HTTP/1.1" 200 71 "-" "python-requests/2.28.1" 0.062131
+
+        127.0.0.1:9851> GET lbs:yandex:wifi e4:6f:13:db:a3:60
+        {"ok":true,"object":{"type":"Point","coordinates":[45.09580882580504,38.99224298033407]},"elapsed":"17.42µs"}
+        127.0.0.1:9851> GET lbs:yandex:wifi 24:a4:3c:7a:c3:0b
+        {"ok":true,"object":{"type":"Point","coordinates":[45.101273,38.98785]},"elapsed":"19.348µs"}
+        127.0.0.1:9851>
+        127.0.0.1:9851>
+        127.0.0.1:9851>
+        127.0.0.1:9851>
+        127.0.0.1:9851> GET wifi e4:6f:13:db:a3:60
+        (error) id not found
+        127.0.0.1:9851> GET wifi 24:a4:3c:7a:c3:0b
+        {"ok":true,"object":{"type":"Point","coordinates":[45.101357036842614,38.98809864197271]},"elapsed":"17.831µs"}
+        127.0.0.1:9851>
+        127.0.0.1:9851> GET lbs:yandex:cell gsm:250:1:12394:115837974
+        {"ok":true,"object":"{\"data\":\"{\\\"location\\\":{\\\"point\\\":{\\\"lat\\\":45.09865951538086,\\\"lon\\\":38.99261474609375},\\\"accuracy\\\":250.0}}\"}","elapsed":"16.013µs"}
+
+        127.0.0.1:9851> GET wifi 50:0f:f5:05:98:21
+        {"ok":true,"object":{"type":"Point","coordinates":[45.09473432577442,38.996939472267826]},"elapsed":"16.154µs"}
+        127.0.0.1:9851> GET wifi c0:e3:50:77:60:30
+        (error) id not found
+        127.0.0.1:9851> GET wifi bc:fd:0c:aa:b4:7d
+        {"ok":true,"object":{"type":"Point","coordinates":[45.046751135344,38.9882512447361]},"elapsed":"15.076µs"}
+        127.0.0.1:9851> GET wifi e4:6f:13:db:a3:60
+        (error) id not found
+        127.0.0.1:9851> GET wifi 24:a4:3c:7a:c3:0b
+        {"ok":true,"object":{"type":"Point","coordinates":[45.101357036842614,38.98809864197271]},"elapsed":"13.53µs"}
+
+        127.0.0.1:9851> GET lbs:yandex:cell gsm:250:1:12394:115837974
+        {"ok":true,"object":"{\"data\":\"{\\\"location\\\":{\\\"point\\\":{\\\"lat\\\":45.09865951538086,\\\"lon\\\":38.99261474609375},\\\"accuracy\\\":250.0}}\"}","elapsed":"19.274µs"}
+        127.0.0.1:9851> GET lbs:yandex:wifi 50:0f:f5:05:98:21
+        (error) id not found
+        127.0.0.1:9851> GET lbs:yandex:wifi c0:e3:50:77:60:30
+        (error) id not found
+        127.0.0.1:9851> GET lbs:yandex:wifi bc:fd:0c:aa:b4:7d
+        (error) id not found
+        127.0.0.1:9851> GET lbs:yandex:wifi e4:6f:13:db:a3:60
+        {"ok":true,"object":{"type":"Point","coordinates":[45.09580882580504,38.99224298033407]},"elapsed":"18.373µs"}
+        127.0.0.1:9851> GET lbs:yandex:wifi 24:a4:3c:7a:c3:0b
+        {"ok":true,"object":{"type":"Point","coordinates":[45.101273,38.98785]},"elapsed":"13.137µs"}
+
+        Лежат на одной прямой, погрешность около 200-250м
+        [45.101273,38.98785]
+        [45.09580882580504,38.99224298033407]
+        {"latitude":45.097519,"longitude":38.990868}
+    */
+
     if points.len() == 2 {
+        let mut outliers = HashMap::with_capacity(2);
+        macs.iter().for_each(|&mac| {
+            if let Some(Some(ylr)) = yandex_lbs_responses.get(mac) {
+                if !cell_points.is_empty() {
+                    let yandex_point = Point {
+                        id: 0,
+                        lat: ylr.location.point.lat,
+                        lon: ylr.location.point.lon,
+                    };
+                    let distance_point_cell = yandex_point.distance(&cell_points[0]);
+                    if distance_point_cell > CONFIG.locator.max_distance_cell * dfc {
+                        outliers.insert(mac.to_string(), ylr.clone());
+                    }
+                } else {
+                    // without data on base stations, ignore both points
+                    outliers.insert(mac.to_string(), ylr.clone());
+                }
+            }
+        });
+        if !outliers.is_empty() {
+            return Some(OutliersYandex { data: outliers });
+        }
+
         let d = points[0].distance(&points[1]);
         if d > CONFIG.yandex_lbs.max_distance_in_cluster {
-            let mut outliers = HashMap::with_capacity(2);
+            // one of the points is an outlier, we don't know which one, we mark both as an outlier
             macs.iter().for_each(|&mac| {
-                if let Some(ylr_opt) = yandex_lbs_responses.get(mac) {
-                    if let Some(ylr) = ylr_opt {
-                        if cell_points.len() > 0 {
-                            let yandex_point = Point {
-                                id: 0,
-                                lat: ylr.location.point.lat,
-                                lon: ylr.location.point.lon,
-                            };
-                            let distance_point_cell = yandex_point.distance(&cell_points[0]);
-                            if distance_point_cell > CONFIG.locator.max_distance_cell {
-                                outliers.insert(mac.to_string(), ylr.clone());
-                            }
-                        } else {
-                            // without data on base stations, ignore both points
-                            outliers.insert(mac.to_string(), ylr.clone());
-                        }
-                    }
+                if let Some(Some(ylr)) = yandex_lbs_responses.get(mac) {
+                    outliers.insert(mac.to_string(), ylr.clone());
                 }
             });
-            if outliers.len() > 0 {
-                return Some(OutliersYandex { outliers });
-            } else {
-                return None;
-            }
+            return Some(OutliersYandex { data: outliers });
         }
         return None;
     }
 
     let mut discarded_by_cell_points = Vec::new();
     let mut filtered_by_cell_points = Vec::new();
-    if cell_points.len() > 0 {
+    if !cell_points.is_empty() {
         points.iter().for_each(|p| {
             let distance_point_cell = p.distance(&cell_points[0]);
-            if distance_point_cell > CONFIG.locator.max_distance_cell {
-                discarded_by_cell_points.push(p.clone());
+            if distance_point_cell > CONFIG.locator.max_distance_cell * dfc {
+                discarded_by_cell_points.push(*p);
             } else {
-                filtered_by_cell_points.push(p.clone());
+                filtered_by_cell_points.push(*p);
             }
         });
-
-        // all points outside the BS service area
-        // TODO: incorrect base station coordinates?
-        if discarded_by_cell_points.len() > 0 && discarded_by_cell_points.len() == points.len() {
-            filtered_by_cell_points = points;
-            discarded_by_cell_points.clear();
-        }
     } else {
         filtered_by_cell_points = points;
     }
 
     let algorithm = DBSCAN::new(CONFIG.yandex_lbs.max_distance_in_cluster, 0);
     let clusters = algorithm.cluster(&filtered_by_cell_points);
-    let actual_clusters = clusters.clusters();
-    let mut noise = clusters.noise();
+
+    let fp_len = filtered_by_cell_points.len();
+    let actual_clusters = if fp_len == 1 {
+        // a case where the outlier is located closer to the BS and is not rejected by the Cell filter,
+        // the actually rejected points are valid
+        if let Some(yo) = estimate_location_by_discarded_points(
+            &macs,
+            &cell_points,
+            &filtered_by_cell_points,
+            &discarded_by_cell_points,
+            &ylrs_filtered,
+        ) {
+            return Some(yo);
+        }
+
+        // a case where the outliers are identified correctly and only one valid point remains
+        vec![filtered_by_cell_points]
+    } else {
+        clusters.clusters()
+    };
+    let mut noise = if fp_len == 1 {
+        vec![]
+    } else {
+        clusters.noise()
+    };
 
     // add points discarded by BS
     noise.append(&mut discarded_by_cell_points);
@@ -672,19 +867,17 @@ pub fn detect_yandex_outliers(
         }
     }
 
-    if noise.len() == 0 {
+    if noise.is_empty() {
         None
     } else {
         let mut outliers = HashMap::with_capacity(noise.len());
         noise.into_iter().for_each(|p| {
             let mac = macs[p.id as usize];
-            if let Some(ylr_opt) = ylrs_filtered.get(&mac.to_string()) {
-                if let Some(ylr) = ylr_opt {
-                    outliers.insert(mac.to_string(), ylr.clone());
-                }
+            if let Some(Some(ylr)) = ylrs_filtered.get(&mac.to_string()) {
+                outliers.insert(mac.to_string(), ylr.clone());
             }
         });
-        Some(OutliersYandex { outliers })
+        Some(OutliersYandex { data: outliers })
     }
 }
 
@@ -699,31 +892,31 @@ pub fn check_point_by_track(
             let mut outliers = HashMap::new();
 
             for (mac, ylr_opt) in ylrs_filtered {
-                if let Some(ylr) = ylr_opt {
-                    if wrt_last.wifi.len() > 0 {
-                        // diff_ts in hours
-                        let diff_ts = (ts_now - wrt_last.ts) as f64 / HOUR as f64;
-                        // max distance in meters
-                        let d_max = f64::min(MAX_DISTANCE, MAX_SCOOTER_SPEED * diff_ts * 1000.0);
-                        let p_last = Point {
-                            id: 0,
-                            lat: wrt_last.wifi[0].g.lat,
-                            lon: wrt_last.wifi[0].g.lon,
-                        };
-                        let p_yandex = Point {
-                            id: 1,
-                            lat: ylr.location.point.lat,
-                            lon: ylr.location.point.lon,
-                        };
-                        let d_yandex_last = p_yandex.distance(&p_last);
-                        if d_yandex_last > d_max {
-                            outliers.insert(mac.clone(), ylr.clone());
-                        }
+                if let Some(ylr) = ylr_opt
+                    && !wrt_last.wifi.is_empty()
+                {
+                    // diff_ts in hours
+                    let diff_ts = (ts_now - wrt_last.ts) as f64 / HOUR as f64;
+                    // max distance in meters
+                    let d_max = f64::min(MAX_DISTANCE, MAX_SCOOTER_SPEED * diff_ts * 1000.0);
+                    let p_last = Point {
+                        id: 0,
+                        lat: wrt_last.wifi[0].g.lat,
+                        lon: wrt_last.wifi[0].g.lon,
+                    };
+                    let p_yandex = Point {
+                        id: 1,
+                        lat: ylr.location.point.lat,
+                        lon: ylr.location.point.lon,
+                    };
+                    let d_yandex_last = p_yandex.distance(&p_last);
+                    if d_yandex_last > d_max {
+                        outliers.insert(mac.clone(), ylr.clone());
                     }
                 }
             }
-            if outliers.len() > 0 {
-                return Some(OutliersYandex { outliers });
+            if !outliers.is_empty() {
+                return Some(OutliersYandex { data: outliers });
             }
         }
     }
@@ -780,32 +973,92 @@ pub async fn yandex_lbs_request_by_individual_wifi_no_save(
     Ok(lbs_responses)
 }
 
+// a case where the outlier is located closer to the BS and is not rejected by the Cell filter,
+// the actually rejected points are valid
+fn estimate_location_by_discarded_points(
+    macs: &[&str],
+    cell_points: &[Point],
+    filtered_by_cell_points: &[Point],
+    discarded_by_cell_points: &[Point],
+    ylrs_filtered: &HashMap<&String, &Option<YandexLbsResponse>>,
+) -> Option<OutliersYandex> {
+    // min_pts=1 means that there must be more than 1 point in the cluster
+    let alg = DBSCAN::new(2.0 * FALLBACK_EPSILON_CLUSTER, 1);
+    let cls = alg.cluster(discarded_by_cell_points);
+    let act_cls = cls.clusters();
+
+    let mut lat_sum = 0.0;
+    let mut lon_sum = 0.0;
+    let mut n = 0.0;
+
+    for cl in act_cls.iter() {
+        for p in cl {
+            n += 1.0;
+            lat_sum += p.lat;
+            lon_sum += p.lon;
+        }
+    }
+
+    if n > 0.0 {
+        // an assessment of the midpoint is necessary to ensure that the boundaries of the BS service area are not exceeded
+        let midpoint = Point {
+            id: 0,
+            lat: lat_sum / n,
+            lon: lon_sum / n,
+        };
+        if !cell_points.is_empty() {
+            let d = midpoint.distance(&cell_points[0]);
+            if act_cls.len() == 1 && d < 1.5 * FALLBACK_LOCATE_DISTANCE {
+                let mut outliers = HashMap::with_capacity(1);
+                let mac = macs[filtered_by_cell_points[0].id as usize];
+                if let Some(Some(ylr)) = ylrs_filtered.get(&mac.to_string()) {
+                    outliers.insert(mac.to_string(), ylr.clone());
+                }
+                return Some(OutliersYandex { data: outliers });
+            }
+        }
+    }
+
+    None
+}
+
 // integrated location assessment for individual access points
 pub fn estimate_location_by_yandex_responses(
     yandex_lbs_responses: &HashMap<String, Option<YandexLbsResponse>>,
+    wms: &[WifiMeasurement],
 ) -> Option<YandexLbsResponse> {
-    let mut lat_weight = 0.0;
-    let mut lon_weight = 0.0;
+    let mut lat_weighted = 0.0;
+    let mut lon_weighted = 0.0;
     let mut w_weight = 0.0;
-    let mut accuracy = std::f64::MAX;
+    let mut c = 0;
+    let mut accuracy = 0.0;
 
-    for (_, ylr_opt) in yandex_lbs_responses {
+    for (mac, ylr_opt) in yandex_lbs_responses {
         if let Some(ylr) = ylr_opt {
-            lat_weight = lat_weight + ylr.location.point.lat * (1.0 / ylr.location.accuracy);
-            lon_weight = lon_weight + ylr.location.point.lon * (1.0 / ylr.location.accuracy);
-            w_weight = w_weight + (1.0 / ylr.location.accuracy);
-            if accuracy > ylr.location.accuracy {
+            let rssi = wms
+                .iter()
+                .find(|wm| wm.bssid == *mac)
+                .map(|wm| wm.signal_strength)
+                .unwrap_or(DEFAULT_RSSI);
+
+            let weight = 10_f64.powf(rssi / (10.0 * SIGNAL_DROP_COEFFICIENT));
+            lat_weighted = lat_weighted + ylr.location.point.lat * weight;
+            lon_weighted = lon_weighted + ylr.location.point.lon * weight;
+            w_weight = w_weight + weight;
+            c += 1;
+
+            if accuracy < ylr.location.accuracy {
                 accuracy = ylr.location.accuracy
             }
         }
     }
 
-    if w_weight > 0.0 && lat_weight > 0.0 && lon_weight > 0.0 {
+    if c > 0 && w_weight > 0.0 && lat_weighted > 0.0 && lon_weighted > 0.0 {
         Some(YandexLbsResponse {
             location: YandexLocation {
                 point: YandexPoint {
-                    lat: lat_weight / w_weight,
-                    lon: lon_weight / w_weight,
+                    lat: lat_weighted / w_weight,
+                    lon: lon_weighted / w_weight,
                 },
                 accuracy,
             },
@@ -815,10 +1068,8 @@ pub fn estimate_location_by_yandex_responses(
     }
 }
 
-#[allow(unused)]
+#[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use clusters::Proximity;
 
     use super::{
@@ -837,7 +1088,9 @@ mod tests {
             }
             Ok(resp) => {
                 println!("Yandex LBS location: {:?}", resp);
-                match yandex_lbs_request_by_individual_wifi_no_save(&CONFIG, wms, DEBUG).await {
+                match yandex_lbs_request_by_individual_wifi_no_save(&CONFIG, wms.clone(), DEBUG)
+                    .await
+                {
                     Err(e) => {
                         println!("Error Yandex LBS request by individual access points: {e}")
                     }
@@ -848,17 +1101,15 @@ mod tests {
                         let outliers_opt =
                             detect_yandex_outliers(&yandex_lbs_responses, cell_opt, wifi_track);
                         if let Some(outliers) = outliers_opt {
-                            for (mac, _ylr_opt) in outliers.outliers {
-                                if let Some(outlier_opt) = yandex_lbs_responses.remove(&mac) {
-                                    if let Some(outlier) = outlier_opt {
-                                        println!("detect Yandex outlier: {:?}", outlier);
-                                    }
+                            for (mac, _ylr_opt) in outliers.outliers() {
+                                if let Some(Some(outlier)) = yandex_lbs_responses.remove(mac) {
+                                    println!("detect Yandex outlier: {:?}", outlier);
                                 }
                             }
                         }
 
                         if let Some(estimated_location) =
-                            estimate_location_by_yandex_responses(&yandex_lbs_responses)
+                            estimate_location_by_yandex_responses(&yandex_lbs_responses, &wms)
                         {
                             println!(
                                 "Estimated location by individual AP: {:?}",

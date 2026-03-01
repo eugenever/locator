@@ -3,21 +3,18 @@ use std::{io, time::Duration};
 use log::error;
 use redis::{FromRedisValue, RedisError};
 
-use crate::tasks::t38::{T38ConnectionManageMessage, get_conection};
+use super::{ERROR_ID_NOT_FOUND, ERROR_KEY_NOT_FOUND, REDIS_NO_DATA};
+use crate::tasks::t38::{T38ConnectionManageMessage, get_connection, get_connection_service};
 
 const TIMEOUT: u64 = 1;
 // loading the big AOF file into memory may take a long time
-const COUNT_ATTEMPTS_RUN_CMD: u16 = 600; // equivalent to 600 seconds
-
-const ID_NOT_FOUND_ERROR: &str = "id not found";
-const KEY_NOT_FOUND_ERROR: &str = "key not found";
-pub const REDIS_NO_DATA: &str = "no data";
+const COUNT_ATTEMPTS_RUN_CMD: u16 = 5; // equivalent to 5 seconds
 
 pub async fn exec_cmd(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     cmd: redis::Cmd,
 ) -> Result<(), RedisError> {
-    let mut connection = get_conection(tx_t38_conn.clone(), None).await.unwrap();
+    let mut connection = get_connection(tx_t38_conn.clone(), None).await.unwrap();
     let mut i: u16 = 0;
 
     while let Err(e) = cmd.exec_async(&mut connection).await {
@@ -40,7 +37,7 @@ pub async fn exec_cmd(
 
         tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
 
-        match get_conection(tx_t38_conn.clone(), Some(e.to_string())).await {
+        match get_connection(tx_t38_conn.clone(), Some(e.to_string())).await {
             Err(e) => {
                 return Err(io::Error::new(io::ErrorKind::NotConnected, e).into());
             }
@@ -48,7 +45,50 @@ pub async fn exec_cmd(
                 connection = c;
             }
         }
-        i = i + 1;
+        i += 1;
+    }
+
+    Ok(())
+}
+
+pub async fn exec_cmd_service(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    cmd: redis::Cmd,
+) -> Result<(), RedisError> {
+    let mut connection = get_connection_service(tx_t38_conn.clone(), None)
+        .await
+        .unwrap();
+    let mut i: u16 = 0;
+
+    while let Err(e) = cmd.exec_async(&mut connection).await {
+        if e.category() == "busy loading" {
+            error!("Tile38 is unavailable because it is loading the dataset into memory");
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Unable to connect to the Tile38 store",
+            )
+            .into());
+        }
+
+        if i > COUNT_ATTEMPTS_RUN_CMD {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Unable to connect to the Tile38 store",
+            )
+            .into());
+        }
+
+        tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
+
+        match get_connection_service(tx_t38_conn.clone(), Some(e.to_string())).await {
+            Err(e) => {
+                return Err(io::Error::new(io::ErrorKind::NotConnected, e).into());
+            }
+            Ok(c) => {
+                connection = c;
+            }
+        }
+        i += 1;
     }
 
     Ok(())
@@ -58,14 +98,14 @@ pub async fn query_cmd(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     cmd: redis::Cmd,
 ) -> Result<Vec<u8>, RedisError> {
-    let mut connection = get_conection(tx_t38_conn.clone(), None).await.unwrap();
+    let mut connection = get_connection(tx_t38_conn.clone(), None).await.unwrap();
     let mut i: u16 = 0;
 
     loop {
         match cmd.query_async(&mut connection).await {
             Err(e) => {
-                if e.to_string().contains(ID_NOT_FOUND_ERROR)
-                    || e.to_string().contains(KEY_NOT_FOUND_ERROR)
+                if e.to_string().contains(ERROR_ID_NOT_FOUND)
+                    || e.to_string().contains(ERROR_KEY_NOT_FOUND)
                 {
                     // id was not found in the tile38 database.
                     return Err(e);
@@ -83,14 +123,14 @@ pub async fn query_cmd(
                 if i > COUNT_ATTEMPTS_RUN_CMD {
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
-                        "Unable to connect to the Redis store",
+                        format!("Unable to connect to the Redis store: {}", e.to_string()),
                     )
                     .into());
                 }
 
                 tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
 
-                match get_conection(tx_t38_conn.clone(), Some(e.to_string())).await {
+                match get_connection(tx_t38_conn.clone(), Some(e.to_string())).await {
                     Err(e) => {
                         error!("get_connecton: {}", e);
                         continue;
@@ -99,7 +139,7 @@ pub async fn query_cmd(
                         connection = c;
                     }
                 }
-                i = i + 1;
+                i += 1;
             }
             Ok(value) => {
                 return Ok(value);
@@ -108,11 +148,68 @@ pub async fn query_cmd(
     }
 }
 
+pub async fn query_cmd_service(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    cmd: redis::Cmd,
+) -> Result<Vec<u8>, RedisError> {
+    let mut connection = get_connection_service(tx_t38_conn.clone(), None)
+        .await
+        .unwrap();
+    let mut i: u16 = 0;
+
+    loop {
+        match cmd.query_async(&mut connection).await {
+            Err(e) => {
+                if e.to_string().contains(ERROR_ID_NOT_FOUND)
+                    || e.to_string().contains(ERROR_KEY_NOT_FOUND)
+                {
+                    // id was not found in the tile38 database.
+                    return Err(e);
+                }
+
+                if e.category() == "busy loading" {
+                    error!("Tile38 is unavailable because it is loading the dataset into memory");
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "Unable to connect to the Tile38 store",
+                    )
+                    .into());
+                }
+
+                if i > COUNT_ATTEMPTS_RUN_CMD {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        format!("Unable to connect to the Redis store: {}", e.to_string()),
+                    )
+                    .into());
+                }
+
+                tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
+
+                match get_connection_service(tx_t38_conn.clone(), Some(e.to_string())).await {
+                    Err(e) => {
+                        error!("get_connecton: {}", e);
+                        continue;
+                    }
+                    Ok(c) => {
+                        connection = c;
+                    }
+                }
+                i += 1;
+            }
+            Ok(value) => {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+#[allow(unused)]
 pub async fn exec_pipeline(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     pipeline: redis::Pipeline,
 ) -> Result<(), RedisError> {
-    let mut connection = get_conection(tx_t38_conn.clone(), None).await.unwrap();
+    let mut connection = get_connection(tx_t38_conn.clone(), None).await.unwrap();
     let mut i: u16 = 0;
 
     while let Err(e) = pipeline.exec_async(&mut connection).await {
@@ -135,7 +232,7 @@ pub async fn exec_pipeline(
 
         tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
 
-        match get_conection(tx_t38_conn.clone(), Some(e.to_string())).await {
+        match get_connection(tx_t38_conn.clone(), Some(e.to_string())).await {
             Err(e) => {
                 return Err(io::Error::new(io::ErrorKind::NotConnected, e).into());
             }
@@ -143,7 +240,7 @@ pub async fn exec_pipeline(
                 connection = c;
             }
         }
-        i = i + 1;
+        i += 1;
     }
 
     Ok(())
@@ -156,7 +253,7 @@ pub async fn query_pipeline<T>(
 where
     T: serde::de::DeserializeOwned + FromRedisValue,
 {
-    let mut connection = get_conection(tx_t38_conn.clone(), None).await.unwrap();
+    let mut connection = get_connection(tx_t38_conn.clone(), None).await.unwrap();
     let mut i: u16 = 0;
 
     loop {
@@ -165,8 +262,8 @@ where
             .await
         {
             Err(e) => {
-                if e.to_string().contains(ID_NOT_FOUND_ERROR)
-                    || e.to_string().contains(KEY_NOT_FOUND_ERROR)
+                if e.to_string().contains(ERROR_ID_NOT_FOUND)
+                    || e.to_string().contains(ERROR_KEY_NOT_FOUND)
                 {
                     // id was not found in the tile38 database.
                     return Err(e);
@@ -184,14 +281,14 @@ where
                 if i > COUNT_ATTEMPTS_RUN_CMD {
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
-                        "Unable to connect to the Redis store",
+                        format!("Failed connect to the Tile38: {}", e),
                     )
                     .into());
                 }
 
                 tokio::time::sleep(Duration::from_secs(TIMEOUT)).await;
 
-                match get_conection(tx_t38_conn.clone(), Some(e.to_string())).await {
+                match get_connection(tx_t38_conn.clone(), Some(e.to_string())).await {
                     Err(e) => {
                         error!("get_connecton: {}", e);
                         continue;
@@ -200,7 +297,7 @@ where
                         connection = c;
                     }
                 }
-                i = i + 1;
+                i += 1;
             }
             Ok(values) => {
                 let mut objects = Vec::with_capacity(values.len());

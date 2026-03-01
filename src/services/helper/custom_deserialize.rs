@@ -1,7 +1,7 @@
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Deserializer};
 
-use crate::error::ApiError;
+use crate::{constants::DEFAULT_RSSI, error::ApiError};
 
 pub fn default_timestamp() -> DateTime<Utc> {
     chrono::offset::Utc::now().round_subsecs(0)
@@ -28,6 +28,14 @@ where
         .ok_or(ApiError::TimestampParseFailed(n.to_string()))
         .map_err(serde::de::Error::custom)?;
     Ok(res)
+}
+
+pub fn validate_rssi<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let r: Option<f64> = Deserialize::deserialize(deserializer)?;
+    Ok(r.map(|v| if v >= 0.0 { DEFAULT_RSSI } else { v }))
 }
 
 // accept mac-address with or without colons:

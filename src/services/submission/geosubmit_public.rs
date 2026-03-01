@@ -8,13 +8,15 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use log::error;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     config::CONFIG,
-    lbs::model::Cell,
+    lbs::model::{Cell, valid_cell},
     services::{
-        helper::custom_deserialize::{date_time_utc_from_str, default_timestamp_ms, mac_address},
+        helper::custom_deserialize::{
+            date_time_utc_from_str, default_timestamp_ms, mac_address, validate_rssi,
+        },
         submission::{
             geosubmit::{Position, PositionSource, Report, Submission, Wifi, insert},
             report::{Position as PositionProcess, Report as ReportProcess, Wifi as WifiProcess},
@@ -103,6 +105,7 @@ struct WifiPublic {
     age: Option<i32>,
     channel: Option<u16>,
     frequency: Option<f64>,
+    #[serde(deserialize_with = "validate_rssi")]
     rssi: Option<f64>,
     snr: Option<f64>,
     ssid: Option<String>,
@@ -195,6 +198,21 @@ pub async fn service(
 ) -> actix_web::Result<impl Responder> {
     let sp = data.into_inner();
 
+    if let Some(rp) = sp.items.first() {
+        if !valid_cell(rp.cell.as_ref()) {
+            return Ok(HttpResponse::UnprocessableEntity().json(json!(
+                {
+                    "error": {
+                        "domain": "report",
+                        "reason": "invalid request",
+                        "message": "unsupported mobile country code",
+                        "code": 422,
+                    }
+                }
+            )));
+        }
+    }
+
     let ua = match req
         .headers()
         .get(USER_AGENT)
@@ -222,14 +240,12 @@ pub async fn service(
         {
             error!("save report in database: {}", err);
         }
-    } else {
-        if let Err(err) = insert(&pool_tp, ua, sp.into(), None)
-            .await
-            .context("Writing to database failed")
-            .map_err(ErrorInternalServerError)
-        {
-            error!("save report in database: {}", err);
-        }
+    } else if let Err(err) = insert(&pool_tp, ua, sp.into(), None)
+        .await
+        .context("Writing to database failed")
+        .map_err(ErrorInternalServerError)
+    {
+        error!("save report in database: {}", err);
     }
 
     Ok(HttpResponse::new(StatusCode::OK))

@@ -1,42 +1,58 @@
-use std::{collections::HashMap, str::FromStr};
+#![allow(unused)]
 
+use std::{collections::HashMap, fmt::Display, str::FromStr};
+
+use actix_web::{HttpRequest, HttpResponse, Responder, http::StatusCode, post, web};
 use chrono::{DateTime, Utc};
 use log::{debug, error, info};
 use redis::RedisError;
 use serde::{Deserialize, Deserializer, Serialize};
-
-const TRACK_SIZE_THRESHOLD: u16 = 3;
+use serde_json::json;
+use tokio_postgres::GenericClient;
 
 use crate::{
     CONFIG,
-    constants::{Collection, WIFI_SSID_IGNORED},
+    constants::{
+        Collection, DEFAULT_RSSI, GPS_VALID_DISTANCE_BY_CELL, GPS_VALID_DISTANCE_BY_WIFI,
+        MAX_DISTANCE_REPORT_LBS, WIFI_SSID_IGNORED,
+    },
     db::{
+        blobasaur::set_ba_lbs_yandex_wifi_one,
         model::{CellRadio, Transmitter},
+        pg::{get_reports_by_range_id, get_required_reports, transmitter::TransmitterLocation},
         t38::{
             fget_wifi_many_from_pipeline, set_yandex_lbs_wifi_one,
             track::{
                 Gnss, WifiTrack, WifiTrackRecord, get_wifi_track_one, set_wifi_track_record_one,
             },
         },
-        transmitter::TransmitterLocation,
     },
     error::ApiError,
     lbs::{
         altergeo::altergeo_lbs_request,
+        http_client::HttpClient,
         model::{self, create_cell_measurement},
         yandex::{
-            WifiMeasurement, YandexLbsResponse, YandexLocation, YandexPoint,
-            yandex_lbs_request_by_individual_wifi,
+            cell::yandex_lbs_request_by_individual_cell,
+            wifi::{
+                WifiMeasurement, YandexLbsResponse, YandexLocation, YandexPoint,
+                yandex_lbs_request_by_individual_wifi,
+            },
         },
-        yandex_cell::yandex_lbs_request_by_individual_cell,
     },
     services::{
         helper::{self, macaddr::MacAddr},
-        locate::dbscan::{Point, Proximity},
+        locate::dbscan::{Point, Proximity, distance_factor_cell},
         rate_limiter::RateLimitersApp,
+        submission::process::run,
     },
-    tasks::{t38::T38ConnectionManageMessage, yandex::YandexApiMessage},
+    tasks::{
+        blobasaur::BAConnectionManageMessage, t38::T38ConnectionManageMessage,
+        yandex::YandexApiMessage,
+    },
 };
+
+const TRACK_SIZE_THRESHOLD: u16 = 3;
 
 /// Serde representation to deserialize report
 #[derive(Deserialize, Serialize, Debug)]
@@ -50,6 +66,158 @@ pub struct Report {
     pub cell_towers: Option<Vec<Cell>>,
     pub wifi_access_points: Option<Vec<Wifi>>,
     pub bluetooth_beacons: Option<Vec<Bluetooth>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct GeoFence {
+    pub lat_min: f64,
+    pub lat_max: f64,
+    pub lon_min: f64,
+    pub lon_max: f64,
+}
+
+impl GeoFence {
+    pub fn validate(&self) -> bool {
+        self.lat_max >= self.lat_min && self.lon_max >= self.lon_min
+    }
+}
+
+impl Display for GeoFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "(lat_min: {}, lat_max: {}, lon_min: {}, lon_max: {})",
+            self.lat_min, self.lat_max, self.lon_min, self.lon_max
+        )
+    }
+}
+
+#[post("/process_report")]
+pub async fn process_report(
+    data: web::Json<GeoFence>,
+    pool_tp: web::Data<deadpool_postgres::Pool>,
+    tx_t38_conn: web::Data<flume::Sender<T38ConnectionManageMessage>>,
+    tx_ba_conn: web::Data<flume::Sender<BAConnectionManageMessage>>,
+    yandex_client: web::Data<HttpClient>,
+    tx_yandex_api: web::Data<flume::Sender<YandexApiMessage>>,
+    rl_app: web::Data<RateLimitersApp>,
+    _req: HttpRequest,
+) -> actix_web::Result<impl Responder> {
+    let gf = data.into_inner();
+    let mut geo_fence = None;
+    if gf.lat_min.round() != 0.0
+        && gf.lat_max.round() != 0.0
+        && gf.lon_min.round() != 0.0
+        && gf.lon_max.round() != 0.0
+    {
+        geo_fence = Some(gf);
+    }
+
+    let result = run(
+        (*pool_tp.into_inner()).clone(),
+        (*tx_t38_conn.into_inner()).clone(),
+        (*tx_ba_conn.into_inner()).clone(),
+        (*yandex_client.into_inner()).clone(),
+        (*tx_yandex_api.into_inner()).clone(),
+        (*rl_app.into_inner()).clone(),
+        geo_fence,
+    )
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))
+    .map(|_| HttpResponse::new(StatusCode::OK));
+
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+pub struct RequredReport {
+    pub ids: Vec<u64>,
+}
+
+#[post("/extract_report")]
+pub async fn extract_report(
+    data: web::Json<RequredReport>,
+    pool_tp: web::Data<deadpool_postgres::Pool>,
+    _req: HttpRequest,
+) -> actix_web::Result<impl Responder> {
+    let er = data.into_inner();
+    let mapper = pool_tp
+        .get()
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+    let client = mapper.client();
+
+    match get_required_reports(client, &er.ids).await {
+        Err(e) => Ok(HttpResponse::new(StatusCode::BAD_REQUEST)),
+        Ok(reports) => {
+            let mut rs = Vec::with_capacity(reports.len());
+            reports.into_iter().for_each(|r| {
+                if let Ok(r) = serde_json::from_slice::<'_, Report>(&r.raw) {
+                    rs.push(r);
+                }
+            });
+            Ok(HttpResponse::Ok().json(rs))
+        }
+    }
+}
+
+// scan reports by condition
+#[post("/scan_reports")]
+pub async fn scan_reports(
+    data: web::Json<RequredReport>,
+    pool_tp: web::Data<deadpool_postgres::Pool>,
+    _req: HttpRequest,
+) -> actix_web::Result<impl Responder> {
+    let sr = data.into_inner();
+    let mapper = pool_tp
+        .get()
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+    let client = mapper.client();
+
+    match get_reports_by_range_id(client, &sr.ids).await {
+        Err(e) => Ok(HttpResponse::new(StatusCode::BAD_REQUEST)),
+        Ok(reports) => {
+            let mut rs = Vec::with_capacity(reports.len());
+            reports.into_iter().for_each(|r| {
+                if let Ok(r) = serde_json::from_slice::<'_, Report>(&r.raw) {
+                    rs.push(r);
+                }
+            });
+
+            let mut c = 0;
+            rs.iter().for_each(|r| {
+                // invalid rxLev
+                /*
+                    if let Some(cell) = r.cell.as_ref()
+                        && let Some(gsm) = cell.gsm.as_ref()
+                    {
+                        if !gsm.is_empty() {
+                            if gsm[0].rxlev >= 0.0 {
+                                c += 1;
+                            }
+                        }
+                    }
+                */
+
+                // invalid RSSI
+                if let Some(waps) = r.wifi_access_points.as_ref() {
+                    waps.iter().for_each(|wap| {
+                        if let Some(rssi) = wap.signal_strength
+                            && rssi >= 0.0
+                        {
+                            c += 1;
+                        }
+                    });
+                }
+            });
+
+            Ok(HttpResponse::Ok().json(json!({
+                    // "count_reports_where_rxlev_greater_than_0": c
+                    "count_wifi_where_rssi_greater_than_0": c
+            })))
+        }
+    }
 }
 
 pub fn timestamp_from_utc_str<'de, D>(deserializer: D) -> Result<i64, D::Error>
@@ -188,10 +356,10 @@ impl Wifi {
         &self,
         report: &Report,
         yandex_lbs_responses: &HashMap<String, Option<YandexLbsResponse>>,
-        yandex_client: reqwest::Client,
+        yandex_client: HttpClient,
         tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+        tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
         ylrs_cell_opt: Option<&HashMap<String, Option<YandexLbsResponse>>>,
-        valid_gps: bool,
     ) -> bool {
         if CONFIG.locator.laa_filter {
             // check mac address (LAA)
@@ -202,14 +370,14 @@ impl Wifi {
                 }
             }
         }
+
         // reject based on ssid
-        if let Some(ssid) = self.ssid.as_ref() {
-            if WIFI_SSID_IGNORED
+        if let Some(ssid) = self.ssid.as_ref()
+            && WIFI_SSID_IGNORED
                 .iter()
                 .any(|ssid_ignored| ssid.to_lowercase().contains(ssid_ignored))
-            {
-                return true;
-            }
+        {
+            return true;
         }
 
         let p_origin = Point {
@@ -217,10 +385,11 @@ impl Wifi {
             lat: report.position.latitude,
             lon: report.position.longitude,
         };
+
         let ignore_by_cell = is_ignore_by_cell(
             yandex_lbs_responses,
             ylrs_cell_opt,
-            &report,
+            report,
             p_origin,
             &self.mac_address,
             tx_t38_conn.clone(),
@@ -228,92 +397,91 @@ impl Wifi {
         .await;
 
         // check by gps and cell, exclude the request in AlterGeo
-        if valid_gps {
-            // cell must be Some(..)
-            if let Some(ignore) = ignore_by_cell {
-                return ignore;
-            }
+        if let Some(ignore) = ignore_by_cell
+            && ignore
+        {
+            return true;
         }
 
-        if let Some(ylr_opt) = yandex_lbs_responses.get(&self.mac_address) {
-            if let Some(ylr) = ylr_opt {
-                let p_yandex = Point {
-                    id: 1,
-                    lat: ylr.location.point.lat,
-                    lon: ylr.location.point.lon,
-                };
-                let d_yandex = p_origin.distance(&p_yandex);
-                if d_yandex > CONFIG.yandex_lbs.max_distance_in_cluster {
-                    // check separately for GPS and Cell,
-                    // since these conditions did not work together previously
+        if let Some(Some(ylr)) = yandex_lbs_responses.get(&self.mac_address) {
+            let p_yandex = Point {
+                id: 1,
+                lat: ylr.location.point.lat,
+                lon: ylr.location.point.lon,
+            };
+            let d_yandex = p_origin.distance(&p_yandex);
 
-                    // cell must be Some(..)
-                    if let Some(ignore) = ignore_by_cell {
-                        return ignore;
-                    }
-                    if valid_gps {
-                        // don't ignore it if the GPS is correct
-                        return false;
-                    }
-
-                    // lastly trying to check through AlterGeo
-                    if CONFIG.altergeo_lbs.enabled {
-                        let collection = Collection::LbsYandexWifi.as_ref();
-                        let wm = WifiMeasurement {
-                            bssid: self.mac_address.clone(),
-                            signal_strength: self.signal_strength.unwrap_or(-90.0).round(),
-                        };
-                        if let Ok(ag_response) = altergeo_lbs_request(vec![wm], yandex_client).await
-                        {
-                            if let Some(iamhere) = ag_response.iamhere {
-                                let p_ag = Point {
-                                    id: 2,
-                                    lat: iamhere.latitude,
-                                    lon: iamhere.longitude,
-                                };
-                                let d_ag = p_origin.distance(&p_ag);
-                                if d_ag < CONFIG.yandex_lbs.max_distance_in_cluster {
-                                    // correct Yandex LBS response in our database
-                                    let correct_yandex_lbs_response = YandexLbsResponse {
-                                        location: YandexLocation {
-                                            accuracy: ylr.location.accuracy,
-                                            point: YandexPoint {
-                                                lat: iamhere.latitude,
-                                                lon: iamhere.longitude,
-                                            },
+            if d_yandex > MAX_DISTANCE_REPORT_LBS {
+                // lastly trying to check through AlterGeo
+                if CONFIG.altergeo_lbs.enabled {
+                    let collection = Collection::LbsYandexWifi.as_ref();
+                    let wm = WifiMeasurement {
+                        bssid: self.mac_address.clone(),
+                        signal_strength: self.signal_strength.unwrap_or(DEFAULT_RSSI).round(),
+                    };
+                    if let Ok(ag_response) = altergeo_lbs_request(vec![wm], yandex_client).await {
+                        if let Some(iamhere) = ag_response.iamhere {
+                            let p_ag = Point {
+                                id: 2,
+                                lat: iamhere.latitude,
+                                lon: iamhere.longitude,
+                            };
+                            let d_ag = p_origin.distance(&p_ag);
+                            if d_ag < MAX_DISTANCE_REPORT_LBS {
+                                // correct Yandex LBS response in our database
+                                let correct_yandex_lbs_response = YandexLbsResponse {
+                                    location: YandexLocation {
+                                        accuracy: ylr.location.accuracy,
+                                        point: YandexPoint {
+                                            lat: iamhere.latitude,
+                                            lon: iamhere.longitude,
                                         },
-                                    };
-                                    if let Err(e) = set_yandex_lbs_wifi_one(
-                                        tx_t38_conn,
-                                        collection,
+                                    },
+                                };
+                                if let Err(e) = set_yandex_lbs_wifi_one(
+                                    tx_t38_conn,
+                                    collection,
+                                    &correct_yandex_lbs_response,
+                                    &self.mac_address,
+                                )
+                                .await
+                                {
+                                    error!("save correct Yandex LBS response: {}", e);
+                                }
+                                info!(
+                                    "AlterGeo check: mac '{}', distance: {:.2}",
+                                    self.mac_address, d_ag
+                                );
+                                // save yandex response in blobasaur
+                                if CONFIG.blobasaur.enabled {
+                                    let namespace = Collection::BaLbsYandexWifi.as_ref();
+                                    if let Err(e) = set_ba_lbs_yandex_wifi_one(
+                                        tx_ba_conn.clone(),
+                                        namespace,
                                         correct_yandex_lbs_response,
                                         &self.mac_address,
                                     )
                                     .await
                                     {
-                                        error!("save correct Yandex LBS response: {}", e);
+                                        error!("save Yandex LBS response in blobasaur: {}", e);
                                     }
-                                    info!(
-                                        "AlterGeo check: mac '{}', distance: {:.2}",
-                                        self.mac_address, d_ag
-                                    );
-                                    // AlterGeo has coordinates close to the original GNSS, so we consider the validation successful
-                                    return false;
                                 }
-                            }
-                            if let Some(ag_error) = ag_response.error {
-                                info!(
-                                    "AlterGeo code {}, error {}",
-                                    ag_error.code, ag_error.message
-                                );
+                                // AlterGeo has coordinates close to the original GNSS, so we consider the validation successful
+                                return false;
                             }
                         }
+                        if let Some(ag_error) = ag_response.error {
+                            info!(
+                                "AlterGeo code {}, error {}",
+                                ag_error.code, ag_error.message
+                            );
+                        }
                     }
-                    // ignore by distance to Yandex point
-                    return true;
-                } else {
-                    return false;
                 }
+                // ignore by distance to Yandex point
+                return true;
+            } else {
+                return false;
             }
         }
         // ignore access points that are not in the LBS
@@ -341,17 +509,17 @@ impl Bluetooth {
 }
 
 fn should_be_ignored(position: &Position, transmitter_age: Option<i32>) -> bool {
-    if let Some(transmitter_age) = transmitter_age {
-        if let Some(position_age) = position.age {
-            let position_transmitter_diff_age: u32 = position_age.abs_diff(transmitter_age);
-            // trasmitter is observed more than 30 seconds from position
-            // Since Neostumbler/18 (1.4.0), age is limited to 30 seconds, before it, the age is not limited
-            if position_transmitter_diff_age > 30_000 {
-                return true;
-            }
-            if position.speed.unwrap_or(0.0) * position_transmitter_diff_age as f64 > 150_000.0 {
-                return true;
-            }
+    if let Some(transmitter_age) = transmitter_age
+        && let Some(position_age) = position.age
+    {
+        let position_transmitter_diff_age: u32 = position_age.abs_diff(transmitter_age);
+        // trasmitter is observed more than 30 seconds from position
+        // Since Neostumbler/18 (1.4.0), age is limited to 30 seconds, before it, the age is not limited
+        if position_transmitter_diff_age > 30_000 {
+            return true;
+        }
+        if position.speed.unwrap_or(0.0) * position_transmitter_diff_age as f64 > 150_000.0 {
+            return true;
         }
     }
     // the age field is optional, so for now observations without an age are still considered valid.
@@ -363,25 +531,36 @@ fn should_be_ignored(position: &Position, transmitter_age: Option<i32>) -> bool 
 pub async fn extract(
     raw: &[u8],
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<(Position, Vec<Transmitter>), ApiError> {
     let report: Report = serde_json::from_slice(raw)?;
-    extract_from_report(report, tx_t38_conn, yandex_client, tx_yandex_api, rl_app).await
+    extract_from_report(
+        report,
+        tx_t38_conn,
+        tx_ba_conn,
+        yandex_client,
+        tx_yandex_api,
+        rl_app,
+    )
+    .await
 }
 
 /// Extract the position and the submitted transmitters from the Report
 pub async fn extract_from_report(
     mut report: Report,
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<(Position, Vec<Transmitter>), ApiError> {
     let ylrs_cell = match extract_cell(
         report.cell.take(),
         tx_t38_conn.clone(),
+        tx_ba_conn.clone(),
         yandex_client.clone(),
         tx_yandex_api.clone(),
         rl_app.clone(),
@@ -398,14 +577,13 @@ pub async fn extract_from_report(
     let mut transmitters = Vec::new();
 
     if let Some(wifi_vec) = report.wifi_access_points.take() {
-        let mut macs = Vec::new();
+        // let mut macs = Vec::new();
         let mut wms = Vec::with_capacity(wifi_vec.len());
         wifi_vec.iter().for_each(|m| {
-            wms.push(crate::lbs::yandex::WifiMeasurement {
+            wms.push(WifiMeasurement {
                 bssid: m.mac_address.clone(),
-                signal_strength: m.signal_strength.unwrap_or(-90.0).round(),
+                signal_strength: m.signal_strength.unwrap_or(DEFAULT_RSSI).round(),
             });
-            macs.push(m.mac_address.as_ref());
         });
 
         let p_origin = Point {
@@ -414,12 +592,10 @@ pub async fn extract_from_report(
             lon: report.position.longitude,
         };
 
-        let valid_gps = is_valid_gps_relative_wifi(&macs, p_origin, tx_t38_conn.clone()).await?;
-
         let yandex_lbs_responses = match yandex_lbs_request_by_individual_wifi(
             tx_t38_conn.clone(),
-            &CONFIG,
-            wms,
+            tx_ba_conn.clone(),
+            &wms,
             yandex_client.clone(),
             tx_yandex_api,
             rl_app,
@@ -445,8 +621,8 @@ pub async fn extract_from_report(
                     &yandex_lbs_responses,
                     yandex_client.clone(),
                     tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
                     Some(&ylrs_cell),
-                    valid_gps,
                 )
                 .await
             {
@@ -489,53 +665,21 @@ async fn is_ignore_by_cell(
     let collection = Collection::LbsYandexWifi.as_ref();
     if let Some(ylrs_cell) = ylrs_cell_opt {
         let mut distance_cell_point = None;
+        let dfc = distance_factor_cell(ylrs_cell);
 
-        for (_cell_code, ylr_cell_opt) in ylrs_cell {
-            if let Some(ylr_cell) = ylr_cell_opt {
-                let p_cell = Point {
-                    id: 2,
-                    lat: ylr_cell.location.point.lat,
-                    lon: ylr_cell.location.point.lon,
-                };
-                distance_cell_point = Some(p_cell.distance(&p_origin));
-            }
-            // only one iteration
-            break;
+        if let Some(Some(ylr_cell)) = ylrs_cell.values().next() {
+            let p_cell = Point {
+                id: 2,
+                lat: ylr_cell.location.point.lat,
+                lon: ylr_cell.location.point.lon,
+            };
+            distance_cell_point = Some(p_cell.distance(&p_origin));
         }
 
         // exclude the request in Altergeo
         // filter Yandex outlier
         if let Some(d) = distance_cell_point {
-            if d < CONFIG.locator.max_distance_cell {
-                // TODO: clarify the value of accuracy
-                let mut accuracy = 150.0;
-                if let Some(ylr_opt) = yandex_lbs_responses.get(mac) {
-                    if let Some(ylr) = ylr_opt {
-                        accuracy = ylr.location.accuracy;
-                    }
-                }
-
-                let correct_yandex_lbs_response = YandexLbsResponse {
-                    location: YandexLocation {
-                        accuracy,
-                        point: YandexPoint {
-                            lat: report.position.latitude,
-                            lon: report.position.longitude,
-                        },
-                    },
-                };
-                if let Err(e) = set_yandex_lbs_wifi_one(
-                    tx_t38_conn,
-                    collection,
-                    correct_yandex_lbs_response,
-                    mac,
-                )
-                .await
-                {
-                    error!("save correct Yandex LBS response: {}", e);
-                }
-                debug!("Cell check: mac '{}', distance: {:.2}", mac, d);
-
+            if d < CONFIG.locator.max_distance_cell * dfc {
                 // don`t ignore point, she's most likely in the BS service area
                 return Some(false);
             } else {
@@ -547,19 +691,19 @@ async fn is_ignore_by_cell(
     None
 }
 
-async fn is_valid_gps_relative_wifi(
+async fn is_gps_valid_relative_wifi(
     macs: &[&str],
     p_origin: Point,
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
 ) -> Result<bool, ApiError> {
     let collection = Collection::Wifi.as_ref();
     let transmitters_existing =
-        fget_wifi_many_from_pipeline::<TransmitterLocation>(tx_t38_conn.clone(), collection, &macs)
+        fget_wifi_many_from_pipeline::<TransmitterLocation>(tx_t38_conn.clone(), collection, macs)
             .await
             .map_err(|e| ApiError::Tile38Error(e.to_string()))?;
 
     let mut valid_gps = false;
-    if transmitters_existing.len() == 0 {
+    if transmitters_existing.is_empty() {
         return Ok(valid_gps);
     }
 
@@ -571,7 +715,8 @@ async fn is_valid_gps_relative_wifi(
                 lon: t.lon,
             };
             let d_origin_t = p_origin.distance(&p_t);
-            if d_origin_t < CONFIG.locator.max_distance_in_cluster {
+            // to improve accuracy, it is necessary to severely limit the GPS_VALID_DISTANCE_BY_WIFI = 50 meters
+            if d_origin_t < GPS_VALID_DISTANCE_BY_WIFI {
                 valid_gps = true;
             }
         }
@@ -580,29 +725,24 @@ async fn is_valid_gps_relative_wifi(
     Ok(valid_gps)
 }
 
-pub fn is_valid_gps_relative_cell(
+pub fn is_gps_valid_relative_cell(
     ylrs_cell_opt: Option<&HashMap<String, Option<YandexLbsResponse>>>,
     p_origin: Point,
-    threshold: f64,
 ) -> Option<bool> {
     if let Some(ylrs_cell) = ylrs_cell_opt {
         let mut distance_cell_point = None;
 
-        for (_cell_code, ylr_cell_opt) in ylrs_cell {
-            if let Some(ylr_cell) = ylr_cell_opt {
-                let p_cell = Point {
-                    id: 2,
-                    lat: ylr_cell.location.point.lat,
-                    lon: ylr_cell.location.point.lon,
-                };
-                distance_cell_point = Some(p_cell.distance(&p_origin));
-            }
-            // only one iteration
-            break;
+        if let Some(Some(ylr_cell)) = ylrs_cell.values().next() {
+            let p_cell = Point {
+                id: 2,
+                lat: ylr_cell.location.point.lat,
+                lon: ylr_cell.location.point.lon,
+            };
+            distance_cell_point = Some(p_cell.distance(&p_origin));
         }
 
         if let Some(d) = distance_cell_point {
-            if d <= threshold {
+            if d <= GPS_VALID_DISTANCE_BY_CELL {
                 // GPS is valid
                 return Some(true);
             } else {
@@ -616,7 +756,8 @@ pub fn is_valid_gps_relative_cell(
 pub async fn extract_cell(
     cell_opt: Option<model::Cell>,
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<HashMap<String, Option<YandexLbsResponse>>, ApiError> {
@@ -624,8 +765,15 @@ pub async fn extract_cell(
     if let Some(cell) = cell_opt {
         cms = create_cell_measurement(&cell);
     }
-    yandex_lbs_request_by_individual_cell(tx_t38_conn, cms, yandex_client, tx_yandex_api, rl_app)
-        .await
+    yandex_lbs_request_by_individual_cell(
+        tx_t38_conn,
+        tx_ba_conn,
+        cms,
+        yandex_client,
+        tx_yandex_api,
+        rl_app,
+    )
+    .await
 }
 
 async fn process_wifi_track(
@@ -634,63 +782,62 @@ async fn process_wifi_track(
     report: &Report,
     yandex_lbs_responses: &HashMap<String, Option<YandexLbsResponse>>,
 ) -> Result<(), RedisError> {
-    if wifi_valid.len() > 0 {
-        if let Some(device_id) = &report.device_id {
-            let collection = Collection::DeviceWhoosh.as_ref();
-            match get_wifi_track_one(tx_t38_conn.clone(), collection, &device_id).await {
-                Err(e) => {
-                    error!("get wifi track for device id '{}': {}", device_id, e);
-                }
-                Ok(wifi_track_opt) => {
-                    let w = wifi_valid
-                        .into_iter()
-                        .map(|wv| {
-                            if let Some(Some(ylr)) = yandex_lbs_responses.get(&wv.mac_address) {
-                                let yandex_gnss = Gnss {
-                                    lat: helper::round(ylr.location.point.lat, 6),
-                                    lon: helper::round(ylr.location.point.lon, 6),
-                                };
-                                crate::db::t38::track::Wifi {
-                                    m: wv.mac_address,
-                                    r: wv.signal_strength.unwrap_or(-90.0),
-                                    g: yandex_gnss,
-                                }
-                            } else {
-                                crate::db::t38::track::Wifi::default()
+    if !wifi_valid.is_empty()
+        && let Some(device_id) = &report.device_id
+    {
+        let collection = Collection::DeviceWhoosh.as_ref();
+        match get_wifi_track_one(tx_t38_conn.clone(), collection, device_id).await {
+            Err(e) => {
+                error!("get wifi track for device id '{}': {}", device_id, e);
+            }
+            Ok(wifi_track_opt) => {
+                let w = wifi_valid
+                    .into_iter()
+                    .map(|wv| {
+                        if let Some(Some(ylr)) = yandex_lbs_responses.get(&wv.mac_address) {
+                            let yandex_gnss = Gnss {
+                                lat: helper::round(ylr.location.point.lat, 6),
+                                lon: helper::round(ylr.location.point.lon, 6),
+                            };
+                            crate::db::t38::track::Wifi {
+                                m: wv.mac_address,
+                                r: wv.signal_strength.unwrap_or(DEFAULT_RSSI),
+                                g: yandex_gnss,
                             }
-                        })
-                        .collect::<Vec<_>>();
-                    let wtr = WifiTrackRecord {
-                        gnss: Some(Gnss {
-                            lat: report.position.latitude,
-                            lon: report.position.longitude,
-                        }),
-                        ts: report.timestamp,
-                        wifi: w,
-                    };
-
-                    let wifi_track = if let Some(mut wt) = wifi_track_opt {
-                        let track_size = wt.records.len() as u16;
-                        if track_size > TRACK_SIZE_THRESHOLD {
-                            // at the moment the track is sorted by timestamp
-                            // does not preserve the order of elements, but works faster
-                            wt.records.swap_remove(0);
-                            // after calling swap_remove, sorting is disrupted
+                        } else {
+                            crate::db::t38::track::Wifi::default()
                         }
-                        wt.records.push(wtr);
-                        wt
-                    } else {
-                        let wt = WifiTrack {
-                            device_id: device_id.clone(),
-                            records: vec![wtr],
-                        };
-                        wt
-                    };
-                    if let Err(e) =
-                        set_wifi_track_record_one(tx_t38_conn.clone(), collection, wifi_track).await
-                    {
-                        error!("set wifi track for device id '{}': {}", device_id, e);
+                    })
+                    .collect::<Vec<_>>();
+                let wtr = WifiTrackRecord {
+                    gnss: Some(Gnss {
+                        lat: report.position.latitude,
+                        lon: report.position.longitude,
+                    }),
+                    ts: report.timestamp,
+                    wifi: w,
+                };
+
+                let wifi_track = if let Some(mut wt) = wifi_track_opt {
+                    let track_size = wt.records.len() as u16;
+                    if track_size > TRACK_SIZE_THRESHOLD {
+                        // at the moment the track is sorted by timestamp
+                        // does not preserve the order of elements, but works faster
+                        wt.records.swap_remove(0);
+                        // after calling swap_remove, sorting is disrupted
                     }
+                    wt.records.push(wtr);
+                    wt
+                } else {
+                    WifiTrack {
+                        device_id: device_id.clone(),
+                        records: vec![wtr],
+                    }
+                };
+                if let Err(e) =
+                    set_wifi_track_record_one(tx_t38_conn.clone(), collection, wifi_track).await
+                {
+                    error!("set wifi track for device id '{}': {}", device_id, e);
                 }
             }
         }
@@ -699,11 +846,11 @@ async fn process_wifi_track(
 }
 
 /// Extract the position and the submitted transmitters from the raw data
-#[allow(unused)]
-pub async fn extract_all_transmitter_types(
+pub async fn _extract_all_transmitter_types(
     raw: &[u8],
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<(Position, Vec<Transmitter>), ApiError> {
@@ -746,17 +893,17 @@ pub async fn extract_all_transmitter_types(
     if let Some(wifi_vec) = &report.wifi_access_points {
         let mut wms = Vec::with_capacity(wifi_vec.len());
         wifi_vec.iter().for_each(|m| {
-            wms.push(crate::lbs::yandex::WifiMeasurement {
+            wms.push(WifiMeasurement {
                 bssid: m.mac_address.clone(),
-                signal_strength: m.signal_strength.unwrap_or(-90.0).round(),
+                signal_strength: m.signal_strength.unwrap_or(DEFAULT_RSSI).round(),
             });
         });
 
         let mut yandex_lbs_responses = HashMap::new();
         match yandex_lbs_request_by_individual_wifi(
             tx_t38_conn.clone(),
-            &CONFIG,
-            wms,
+            tx_ba_conn.clone(),
+            &wms,
             yandex_client.clone(),
             tx_yandex_api,
             rl_app,
@@ -773,7 +920,7 @@ pub async fn extract_all_transmitter_types(
             }
         }
 
-        let valid_gps = false;
+        // let valid_gps = false;
 
         for wifi in wifi_vec {
             // check the rules of ignoring
@@ -783,8 +930,8 @@ pub async fn extract_all_transmitter_types(
                     &yandex_lbs_responses,
                     yandex_client.clone(),
                     tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
                     None,
-                    valid_gps,
                 )
                 .await
             {

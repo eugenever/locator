@@ -115,13 +115,11 @@
 //!
 //! [1]: https://en.wikipedia.org/wiki/DBSCAN
 
-#![allow(unused)]
-
 mod outlier;
 mod point;
 
 pub use clusters::{Algorithm, Clustered, Proximity};
-pub use outlier::{check_outlier, create_cell_points, detect_outliers};
+pub use outlier::{check_outlier, create_cell_points, detect_outliers, distance_factor_cell};
 pub use point::Point;
 
 use std::collections::HashMap;
@@ -189,11 +187,11 @@ where
     /// `cluster` function can be used to retrieve the clusters.
     ///
     /// - `clusterables` This is a list of the data points fed into the
-    /// algorithm for clustering
+    ///   algorithm for clustering
     /// - `epsilon` This parameter is used to determine the proximity of
-    /// datapoints
+    ///   datapoints
     /// - `min_pts` The algorithm has a concept of 'core points' which are
-    /// data points with more than `min_pts` neighbours.
+    ///   data points with more than `min_pts` neighbours.
     pub fn new(epsilon: <T as Proximity>::Output, min_pts: usize) -> DBSCAN<T> {
         DBSCAN { epsilon, min_pts }
     }

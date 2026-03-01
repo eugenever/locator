@@ -83,7 +83,7 @@ where
 pub enum Error {
     SpawnTimeout,
     RunTimeout(Option<TaskId>),
-    SpawnSemaphoneAcquireError,
+    SpawnSemaphoneAcquire,
     NotAvailable,
 }
 
@@ -98,7 +98,7 @@ impl fmt::Display for Error {
                     write!(f, "task run timeout")
                 }
             }
-            Error::SpawnSemaphoneAcquireError => write!(f, "task spawn semaphore error"),
+            Error::SpawnSemaphoneAcquire => write!(f, "task spawn semaphore error"),
             Error::NotAvailable => write!(f, "no available task slots"),
         }
     }
@@ -108,7 +108,7 @@ impl std::error::Error for Error {}
 
 impl From<tokio::sync::AcquireError> for Error {
     fn from(_: tokio::sync::AcquireError) -> Self {
-        Self::SpawnSemaphoneAcquireError
+        Self::SpawnSemaphoneAcquire
     }
 }
 

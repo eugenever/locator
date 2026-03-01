@@ -1,3 +1,3 @@
 mod config;
 
-pub use config::{CONFIG, Config};
+pub use config::{CONFIG, Config, YandexApiKey};

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::{db::transmitter::TransmitterLocation, tasks::t38::T38ConnectionManageMessage};
+use crate::{db::pg::transmitter::TransmitterLocation, tasks::t38::T38ConnectionManageMessage};
 
 /// A transmitter (cell tower, wifi network or bluetooth beacon)
 #[derive(Debug, Clone, PartialEq, PartialOrd, strum_macros::Display)]

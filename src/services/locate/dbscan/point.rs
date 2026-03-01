@@ -5,7 +5,7 @@ use std::{
 
 use geo::{Distance, Haversine, Point as GeoPoint};
 
-use super::{Algorithm, DBSCAN, Proximity};
+use super::Proximity;
 
 /// Represents a 2 Dimensional point
 #[derive(Clone, Copy, Debug)]
@@ -51,16 +51,8 @@ impl fmt::Display for Point {
 
 #[cfg(test)]
 mod tests {
-    //! This is an example of implementing DBSCAN for a 2D cartesian system
-    //!
-    //! The struct `Point` is our main 'clusterable' type. The algorithm requires
-    //! that a number of traits be implemented by this type before it can be used.
-    //!
-    //! In the tests function we define a number of 2D points and use the algorithm
-    //! to cluster them accordingly and print out the clusters
-    //!
-    //!
-    use super::{Algorithm, DBSCAN, Point};
+    use super::Point;
+    use crate::services::locate::dbscan::{Algorithm, DBSCAN};
 
     #[test]
     fn test_cluster_with_noise() {

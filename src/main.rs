@@ -19,8 +19,11 @@ use tokio::task::JoinHandle;
 
 use crate::{
     config::CONFIG,
+    constants::HC,
+    lbs::http_client::HttpClient,
     services::{crate_rate_limiters_app, validator},
     tasks::{
+        blobasaur::{self, BAConnectionManageMessage},
         report::MessageSaveReport,
         t38::{self, T38ConnectionManageMessage},
         yandex::YandexApiMessage,
@@ -42,17 +45,6 @@ struct Cli {
 enum Command {
     /// Serve the Locator geolocate service
     Serve,
-    /// Process newly submitted reports
-    Process,
-    /// Export a map of all data as h3 hexagons
-    Map,
-    /// Archive reports out of the database
-    Archive {
-        #[clap(subcommand)]
-        command: services::archive::ArchiveCommand,
-    },
-    /// Reformat data to the MLS format
-    FormatMls,
 }
 
 #[tokio::main]
@@ -71,7 +63,7 @@ async fn main() -> Result<()> {
         exit(1);
     }
 
-    let pool_tp = db::pool::create_pool_tp(&CONFIG)?;
+    let pool_tp = db::pg::pool::create_pool_tp(&CONFIG)?;
     let _pool_tokio_task = services::helper::pool_task::Pool::bounded(16);
 
     let thread_pool_name = "locator".to_string();
@@ -82,7 +74,14 @@ async fn main() -> Result<()> {
         CONFIG.threadpool.keep_alive,
     )?;
 
-    let yandex_client = reqwest::Client::new();
+    let yandex_client = match CONFIG.locator.http_client.as_str() {
+        "surf" => HttpClient::new(HC::Surf),
+        "reqwest" => HttpClient::new(HC::Reqwest),
+        _ => {
+            error!("unsupported http client: {}", CONFIG.locator.http_client);
+            exit(1);
+        }
+    };
     let gh_client = reqwest::Client::new();
 
     let (tx_yandex_api, rx_yandex_api) = flume::unbounded::<YandexApiMessage>();
@@ -95,9 +94,15 @@ async fn main() -> Result<()> {
         Command::Serve => {
             let (tx_t38_conn, rx_t38_conn) = flume::unbounded::<T38ConnectionManageMessage>();
             let _connection_manage_t38_handle =
-                t38::connection_manage_task(&CONFIG, rx_t38_conn, tx_t38_conn.clone()).await?;
+                t38::connection_manage_task(rx_t38_conn, tx_t38_conn.clone()).await?;
 
-            db::create_partitions(pool_tp.clone()).await?;
+            let (tx_ba_conn, rx_ba_conn) = flume::unbounded::<BAConnectionManageMessage>();
+            if CONFIG.blobasaur.enabled {
+                let _connection_manage_ba_handle =
+                    blobasaur::manage_blobasaur(rx_ba_conn, tx_ba_conn.clone()).await?;
+            }
+
+            db::pg::create_partitions(pool_tp.clone()).await?;
 
             let mut tx_report_opt = None;
             let save_report_handle_opt = None;
@@ -106,6 +111,7 @@ async fn main() -> Result<()> {
                 let _process_reports_handle = tasks::report::process_reports_task(
                     pool_tp.clone(),
                     tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
                     yandex_client.clone(),
                     tx_yandex_api.clone(),
                     rl_app.clone(),
@@ -120,6 +126,7 @@ async fn main() -> Result<()> {
                 for _ in 0..CONFIG.locator.tasks_processing_reports_count {
                     let online_process_report_handle = tasks::report::online_process_report_task(
                         tx_t38_conn.clone(),
+                        tx_ba_conn.clone(),
                         yandex_client.clone(),
                         tx_yandex_api.clone(),
                         rl_app.clone(),
@@ -174,17 +181,41 @@ async fn main() -> Result<()> {
                 CONFIG.server.http_port
             );
 
+            // let _ = db::t38::scan::scan_yandex_wifi(
+            //     tx_t38_conn.clone(),
+            //     tx_ba_conn.clone(),
+            //     "lbs:yandex:wifi",
+            //     400000,
+            // )
+            // .await;
+
+            // let _ =
+            //     db::t38::scan::scan_wifi(tx_t38_conn.clone(), tx_ba_conn.clone(), "wifi", 300000)
+            //         .await;
+
+            // let _ = db::t38::scan::scan_yandex_cell(
+            //     tx_t38_conn.clone(),
+            //     tx_ba_conn.clone(),
+            //     "lbs:yandex:cell",
+            //     300000,
+            // )
+            // .await;
+
             let pool_tp_clone = pool_tp.clone();
             let server = HttpServer::new(move || {
-                let logger = Logger::new("%a %{User-Agent}i")
-                    .exclude("/api/v1/locate")
-                    .exclude("/api/v1/report")
+                let logger = Logger::new("%a \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\" %T\n")
+                    // DEBUG
+                    // TODO: unblocking after tests by Whoosh
+                    // .exclude("/api/v1/locate")
+                    // .exclude("/api/v1/report")
                     .exclude("/api/v1/country")
                     .exclude("/api/v1/match")
+                    .exclude("/api/v1/extract_report")
                     .exclude("/api/v1/cell");
 
                 App::new()
                     .app_data(web::Data::new(pool_tp_clone.clone()))
+                    .app_data(web::Data::new(tx_ba_conn.clone()))
                     .app_data(web::Data::new(tx_t38_conn.clone()))
                     .app_data(web::Data::new(rl_app.clone()))
                     .app_data(web::Data::new(thread_pool.clone()))
@@ -200,6 +231,9 @@ async fn main() -> Result<()> {
                         web::scope("/api/v1")
                             .service(services::geolocate_public::service)
                             .service(services::submission::geosubmit_public::service)
+                            .service(services::submission::report::extract_report)
+                            .service(services::submission::report::scan_reports)
+                            .service(services::submission::report::process_report)
                             .service(services::submission::cell::service)
                             .service(services::health::service)
                             .service(services::routing::matching::service)
@@ -220,21 +254,6 @@ async fn main() -> Result<()> {
             tokio::spawn(graceful_shutdown(handle, save_report_handle_opt));
             server.await?;
         }
-        Command::Process => {
-            let (tx_t38_conn, rx_t38_conn) = flume::unbounded::<T38ConnectionManageMessage>();
-            let _ = t38::connection_manage_task(&CONFIG, rx_t38_conn, tx_t38_conn.clone()).await?;
-            services::submission::process::run(
-                pool_tp,
-                tx_t38_conn,
-                yandex_client,
-                tx_yandex_api.clone(),
-                rl_app.clone(),
-            )
-            .await?;
-        }
-        Command::Map => services::map::run(pool_tp).await?,
-        Command::Archive { command } => services::archive::run(pool_tp, command).await?,
-        Command::FormatMls => services::mls::format()?,
     };
 
     Ok(())

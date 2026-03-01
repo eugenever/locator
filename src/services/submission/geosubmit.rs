@@ -179,7 +179,7 @@ pub async fn insert(
         // Ignore reports for (-1,-1) to (1, 1)
         !(r.position.latitude.abs() <= 1. && r.position.longitude.abs() <= 1.)
     }) {
-        crate::db::insert_report(client, report, user_agent.clone(), ts_now).await?;
+        crate::db::pg::insert_report(client, report, user_agent.clone(), ts_now).await?;
     }
 
     Ok(())

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     db::t38::{
-        ID_NOT_FOUND_ERROR, KEY_NOT_FOUND_ERROR,
+        ERROR_ID_NOT_FOUND, ERROR_KEY_NOT_FOUND,
         cmd::{exec_cmd, query_cmd},
     },
     tasks::t38::T38ConnectionManageMessage,
@@ -69,20 +69,20 @@ pub async fn get_wifi_track_one(
     match query_cmd(tx_t38_conn, cmd_arg).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(None);
             }
             error!(
                 "device id '{}', get wifi track record data: {}",
                 device_id, e
             );
-            return Err(e);
+            Err(e)
         }
         Ok(value) => {
             // crud.go, row 1132, return empty bulk-string:
             // return resp.StringValue(""), nil
             // alternative for ID_NOT_FOUND_ERROR
-            if value.len() == 0 {
+            if value.is_empty() {
                 return Ok(None);
             }
 

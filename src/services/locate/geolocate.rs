@@ -1,20 +1,4 @@
-//! Contains the main geolocalization service.
-//!
-//! To geolocate a request `Locator` first tries to locate based on the
-//! surrounding WiFi networks.
-//! A weight is determined by the WiFi signal strength reported by the client.
-//! The center of the bounding boxes of the networks are queried and the
-//! center position is averaged based on the weight.
-//!
-//! At least two WiFi networks have to been known to accurately determine the
-//! position.
-//! If this is not the case the position of the current cell tower is returned.
-//!
-//! If the cell tower is not known to `Locator` the location is estimated
-//! using the client's ip.
-//!
-//! WiFi networks are ignored if the bounding box if spans more than CONFIG.radius_wifi_detection (500m)
-//! to filter out moving access points.
+#![allow(unused)]
 
 use std::collections::HashSet;
 
@@ -26,19 +10,23 @@ use serde_json::json;
 use super::dbscan::{check_outlier, detect_outliers};
 use crate::{
     CONFIG,
-    constants::SIGNAL_DROP_COEFFICIENT,
+    constants::{DEFAULT_RSSI, SIGNAL_DROP_COEFFICIENT},
     db::{model::CellRadio, t38::fget_wifi_many_from_pipeline},
     error::{ApiError, create_error_response},
-    lbs::yandex::{
-        detect_yandex_outliers, estimate_location_by_yandex_responses,
-        yandex_lbs_request_by_individual_wifi,
+    lbs::{
+        http_client::HttpClient,
+        yandex::wifi::{
+            WifiMeasurement, detect_yandex_outliers, estimate_location_by_yandex_responses,
+            yandex_lbs_request_by_individual_wifi,
+        },
     },
     services::{helper::custom_deserialize::mac_address, rate_limiter::RateLimitersApp},
-    tasks::{t38::T38ConnectionManageMessage, yandex::YandexApiMessage},
+    tasks::{
+        blobasaur::BAConnectionManageMessage, t38::T38ConnectionManageMessage,
+        yandex::YandexApiMessage,
+    },
 };
 
-/// Serde representation of the client's request
-#[allow(unused)]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct LocationRequest {
@@ -55,13 +43,11 @@ struct LocationRequest {
     fallbacks: Option<FallbackOptions>,
 }
 
-#[allow(unused)]
 #[derive(Debug, Deserialize, Default)]
 struct FallbackOptions {
     ipf: Option<bool>,
 }
 
-#[allow(unused)]
 // Serde representation of cell towers in the client's request
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,8 +111,9 @@ struct Location {
 pub async fn service(
     data: Option<web::Json<LocationRequest>>,
     tx_t38_conn: web::Data<flume::Sender<T38ConnectionManageMessage>>,
+    tx_ba_conn: web::Data<flume::Sender<BAConnectionManageMessage>>,
     rl_app_web: web::Data<RateLimitersApp>,
-    yandex_client_web: web::Data<reqwest::Client>,
+    yandex_client_web: web::Data<HttpClient>,
     tx_yandex_api_web: web::Data<flume::Sender<YandexApiMessage>>,
     _req: HttpRequest,
 ) -> actix_web::Result<HttpResponse> {
@@ -154,6 +141,7 @@ pub async fn service(
 
     let collection = crate::constants::Collection::Wifi.as_ref();
     let tx_t38c = (*tx_t38_conn.into_inner()).clone();
+    let tx_ba_c = (*tx_ba_conn.into_inner()).clone();
 
     let tls = fget_wifi_many_from_pipeline(tx_t38c.clone(), collection, &macs)
         .await
@@ -172,6 +160,7 @@ pub async fn service(
     let outliers_opt = match detect_outliers(
         &tls,
         tx_t38c.clone(),
+        tx_ba_c.clone(),
         yandex_client.clone(),
         tx_yandex_api.clone(),
         rl_app.clone(),
@@ -185,29 +174,28 @@ pub async fn service(
         Ok(o) => o,
     };
 
-    for tl_opt in tls.iter() {
-        if let Some(tl) = tl_opt {
-            // skip the outlier TransmitterLocation
-            if check_outlier(outliers_opt.as_ref(), &tl) {
-                continue;
-            }
+    for tl in tls.iter().flatten() {
+        // skip the outlier TransmitterLocation
+        if check_outlier(outliers_opt.as_ref(), &tl) {
+            continue;
+        }
 
-            if tl.valid() {
-                let wap_signal_strength = data
-                    .wifi_access_points
-                    .iter()
-                    .find(|wap| *wap.mac_address == tl.mac)
-                    .and_then(|wap| wap.signal_strength);
+        if tl.valid() {
+            let wap_signal_strength = data
+                .wifi_access_points
+                .iter()
+                .find(|wap| *wap.mac_address == tl.mac)
+                .and_then(|wap| wap.signal_strength);
 
-                // At this point, we can use the real coordinates
-                let weight = 10_f64
-                    .powf(wap_signal_strength.unwrap_or(-90.0) / (10.0 * SIGNAL_DROP_COEFFICIENT));
-                lat_weight = lat_weight + tl.lat * weight;
-                lon_weight = lon_weight + tl.lon * weight;
-                r_weight = r_weight + tl.accuracy * weight;
-                w_weight = w_weight + weight;
-                c = c + 1;
-            }
+            // At this point, we can use the real coordinates
+            let weight = 10_f64.powf(
+                wap_signal_strength.unwrap_or(DEFAULT_RSSI) / (10.0 * SIGNAL_DROP_COEFFICIENT),
+            );
+            lat_weight = lat_weight + tl.lat * weight;
+            lon_weight = lon_weight + tl.lon * weight;
+            r_weight = r_weight + tl.accuracy * weight;
+            w_weight = w_weight + weight;
+            c = c + 1;
         }
     }
 
@@ -227,16 +215,16 @@ pub async fn service(
     if CONFIG.yandex_lbs.enabled {
         let mut wms = Vec::with_capacity(data.wifi_access_points.len());
         data.wifi_access_points.iter().for_each(|m| {
-            wms.push(crate::lbs::yandex::WifiMeasurement {
+            wms.push(WifiMeasurement {
                 bssid: m.mac_address.clone(),
-                signal_strength: m.signal_strength.unwrap_or(-90.0),
+                signal_strength: m.signal_strength.unwrap_or(DEFAULT_RSSI),
             });
         });
 
         match yandex_lbs_request_by_individual_wifi(
             tx_t38c,
-            &CONFIG,
-            wms,
+            tx_ba_c,
+            &wms,
             yandex_client,
             tx_yandex_api,
             rl_app,
@@ -248,21 +236,19 @@ pub async fn service(
                 return Ok(create_error_response(e, "locate"));
             }
             Ok(mut yandex_lbs_responses) => {
-                if yandex_lbs_responses.len() > 0 {
+                if !yandex_lbs_responses.is_empty() {
                     // remove Yandex outliers
                     let outliers_opt = detect_yandex_outliers(&yandex_lbs_responses, None, None);
                     if let Some(outliers) = outliers_opt {
-                        for (mac, _ylr_opt) in outliers.outliers {
-                            if let Some(outlier_opt) = yandex_lbs_responses.remove(&mac) {
-                                if let Some(outlier) = outlier_opt {
-                                    debug!("detect Yandex outlier: {:?}", outlier);
-                                }
+                        for (mac, _ylr_opt) in outliers.outliers() {
+                            if let Some(Some(outlier)) = yandex_lbs_responses.remove(mac) {
+                                debug!("detect Yandex outlier: {:?}", outlier);
                             }
                         }
                     }
 
                     if let Some(estimated_yandex_lbs_response) =
-                        estimate_location_by_yandex_responses(&yandex_lbs_responses)
+                        estimate_location_by_yandex_responses(&yandex_lbs_responses, &wms)
                     {
                         return LocationResponse::new(
                             estimated_yandex_lbs_response.location.point.lat,

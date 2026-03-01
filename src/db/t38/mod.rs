@@ -8,10 +8,13 @@ use log::error;
 use redis::{
     AsyncConnectionConfig, Client, FromRedisValue, RedisError, aio::MultiplexedConnection,
 };
-use serde::Deserialize;
 
 use crate::{
-    db::transmitter::TransmitterLocation, lbs::yandex::YandexLbsResponse,
+    db::{
+        pg::transmitter::TransmitterLocation,
+        t38::cmd::{exec_cmd_service, query_cmd_service},
+    },
+    lbs::yandex::wifi::{YandexLbsResponse, YandexWifiMissing},
     tasks::t38::T38ConnectionManageMessage,
 };
 use cmd::{exec_cmd, query_cmd, query_pipeline};
@@ -20,26 +23,9 @@ const TIMEOUT: u64 = 1;
 // loading the big AOF file into memory may take a long time
 const COUNT_ATTEMPTS_RUN_CMD: u16 = 600; // equivalent to 600 seconds
 
-pub const ID_NOT_FOUND_ERROR: &str = "id not found";
-pub const KEY_NOT_FOUND_ERROR: &str = "key not found";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct T38Role {
-    // slave or master
-    pub role: String,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub state: Option<String>,
-    pub offset: Option<i32>,
-    pub slaves: Option<Vec<T38Slave>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct T38Slave {
-    pub ip: String,
-    pub port: String,
-    pub offset: String,
-}
+pub const ERROR_ID_NOT_FOUND: &str = "id not found";
+pub const ERROR_KEY_NOT_FOUND: &str = "key not found";
+pub const REDIS_NO_DATA: &str = "no data";
 
 #[derive(Debug, Clone)]
 pub struct T38Node {
@@ -55,7 +41,7 @@ pub fn t38_client(host: &str, port: u16) -> Result<redis::Client, RedisError> {
     redis::Client::open(host)
 }
 
-pub async fn create_connection(
+pub async fn _create_connection(
     host: &str,
     port: u16,
 ) -> Result<redis::aio::MultiplexedConnection, RedisError> {
@@ -75,6 +61,13 @@ pub async fn healthz(
     exec_cmd(tx_t38_conn, cmd).await
 }
 
+pub async fn healthz_service(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+) -> Result<(), RedisError> {
+    let cmd = redis::cmd("HEALTHZ");
+    exec_cmd_service(tx_t38_conn, cmd).await
+}
+
 pub async fn aofshrink(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
 ) -> Result<(), RedisError> {
@@ -87,7 +80,7 @@ pub async fn gc(tx_t38_conn: flume::Sender<T38ConnectionManageMessage>) -> Resul
     exec_cmd(tx_t38_conn, cmd).await
 }
 
-pub async fn ping(mut connection: MultiplexedConnection) -> Result<(), RedisError> {
+pub async fn _ping(mut connection: MultiplexedConnection) -> Result<(), RedisError> {
     if let Err(e) = redis::cmd("PING").exec_async(&mut connection).await {
         error!("ping: {}", e);
     };
@@ -97,9 +90,7 @@ pub async fn ping(mut connection: MultiplexedConnection) -> Result<(), RedisErro
 pub async fn get_role(mut connection: MultiplexedConnection) -> Result<Option<String>, RedisError> {
     let cmd = redis::cmd("ROLE");
     match cmd.query_async::<Vec<redis::Value>>(&mut connection).await {
-        Err(e) => {
-            return Err(e);
-        }
+        Err(e) => Err(e),
         Ok(values) => {
             /*
                 MASTER response:
@@ -185,15 +176,13 @@ where
     match query_pipeline(tx_t38_conn, pipeline).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(vec![]);
             }
             error!("fget wifi data from pipeline: {}", e);
-            return Err(e);
+            Err(e)
         }
-        Ok(objects) => {
-            return Ok(objects);
-        }
+        Ok(objects) => Ok(objects),
     }
 }
 
@@ -216,15 +205,13 @@ where
     match query_pipeline(tx_t38_conn, pipeline).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(vec![]);
             }
             error!("get wifi data from pipeline: {}", e);
-            return Err(e);
+            Err(e)
         }
-        Ok(objects) => {
-            return Ok(objects);
-        }
+        Ok(objects) => Ok(objects),
     }
 }
 
@@ -241,17 +228,17 @@ pub async fn get_wifi_one(
     match query_cmd(tx_t38_conn, cmd_arg).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(None);
             }
             error!("get wifi data: {}", e);
-            return Err(e);
+            Err(e)
         }
         Ok(value) => {
             // crud.go, row 972, return empty bulk-string:
             // return resp.StringValue(""), nil
             // alternative for ID_NOT_FOUND_ERROR
-            if value.len() == 0 {
+            if value.is_empty() {
                 return Ok(None);
             }
 
@@ -262,14 +249,33 @@ pub async fn get_wifi_one(
     }
 }
 
+pub async fn del_wifi_one(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    collection: &str,
+    mac: &str,
+) -> Result<(), RedisError> {
+    let cmd_arg = redis::cmd("DEL").arg(collection).arg(mac).to_owned();
+    match exec_cmd(tx_t38_conn, cmd_arg).await {
+        Err(e) => {
+            let e_str = e.to_string();
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
+                return Ok(());
+            }
+            error!("del Yandex LBS data: {}", e);
+            Err(e)
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
 // collection = "lbs:yandex:wifi"
 pub async fn set_yandex_lbs_wifi_one(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     collection: &str,
-    yandex_lbs_response: YandexLbsResponse,
+    yandex_lbs_response: &YandexLbsResponse,
     mac: &str,
 ) -> Result<(), RedisError> {
-    let ylr_bytes = serde_json::to_vec(&yandex_lbs_response).unwrap();
+    let ylr_bytes = serde_json::to_vec(yandex_lbs_response).unwrap();
     let cmd_arg = redis::cmd("SET")
         .arg(collection)
         .arg(mac)
@@ -300,17 +306,17 @@ pub async fn get_yandex_lbs_wifi_one(
     match query_cmd(tx_t38_conn, cmd_arg).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(None);
             }
             error!("get Yandex LBS data: {}", e);
-            return Err(e);
+            Err(e)
         }
         Ok(value) => {
             // crud.go, row 972, return empty bulk-string:
             // return resp.StringValue(""), nil
             // alternative for ID_NOT_FOUND_ERROR
-            if value.len() == 0 {
+            if value.is_empty() {
                 return Ok(None);
             }
 
@@ -325,10 +331,10 @@ pub async fn get_yandex_lbs_wifi_one(
 pub async fn set_yandex_lbs_cell_one(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     collection: &str,
-    yandex_lbs_response: YandexLbsResponse,
+    yandex_lbs_response: &YandexLbsResponse,
     cell_code: &str,
 ) -> Result<(), RedisError> {
-    let ylr_bytes = serde_json::to_vec(&yandex_lbs_response).unwrap();
+    let ylr_bytes = serde_json::to_vec(yandex_lbs_response).unwrap();
     let cmd_arg = redis::cmd("JSET")
         .arg(collection)
         .arg(cell_code)
@@ -336,6 +342,26 @@ pub async fn set_yandex_lbs_cell_one(
         .arg(ylr_bytes)
         .to_owned();
     exec_cmd(tx_t38_conn, cmd_arg).await
+}
+
+// collection = "lbs:yandex:wifi"
+pub async fn del_yandex_lbs_wifi_one(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    collection: &str,
+    mac: &str,
+) -> Result<(), RedisError> {
+    let cmd_arg = redis::cmd("DEL").arg(collection).arg(mac).to_owned();
+    match exec_cmd(tx_t38_conn, cmd_arg).await {
+        Err(e) => {
+            let e_str = e.to_string();
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
+                return Ok(());
+            }
+            error!("del Yandex LBS data: {}", e);
+            Err(e)
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 // collection = "lbs:yandex:cell"
@@ -352,17 +378,17 @@ pub async fn get_yandex_lbs_cell_one(
     match query_cmd(tx_t38_conn, cmd_arg).await {
         Err(e) => {
             let e_str = e.to_string();
-            if e_str.contains(ID_NOT_FOUND_ERROR) || e_str.contains(KEY_NOT_FOUND_ERROR) {
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
                 return Ok(None);
             }
             error!("get Yandex LBS data: {}", e);
-            return Err(e);
+            Err(e)
         }
         Ok(value) => {
             // crud.go, row 972, return empty bulk-string:
             // return resp.StringValue(""), nil
             // alternative for ID_NOT_FOUND_ERROR
-            if value.len() == 0 {
+            if value.is_empty() {
                 return Ok(None);
             }
 
@@ -373,9 +399,59 @@ pub async fn get_yandex_lbs_cell_one(
     }
 }
 
+// collection = "lbs:yandex:wifi:missing"
+pub async fn set_yandex_lbs_wifi_missing_one(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    collection: &str,
+    ywm: YandexWifiMissing,
+) -> Result<(), RedisError> {
+    let ylr_bytes = serde_json::to_vec(&ywm).unwrap();
+    let cmd_arg = redis::cmd("JSET")
+        .arg(collection)
+        .arg(&ywm.mac)
+        .arg("data")
+        .arg(ylr_bytes)
+        .to_owned();
+    exec_cmd_service(tx_t38_conn, cmd_arg).await
+}
+
+// collection = "lbs:yandex:wifi:missing"
+pub async fn get_yandex_lbs_wifi_missing_one(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    collection: &str,
+    mac: &str,
+) -> Result<Option<YandexWifiMissing>, RedisError> {
+    let cmd_arg = redis::cmd("JGET")
+        .arg(collection)
+        .arg(mac)
+        .arg("data")
+        .to_owned();
+    match query_cmd_service(tx_t38_conn, cmd_arg).await {
+        Err(e) => {
+            let e_str = e.to_string();
+            if e_str.contains(ERROR_ID_NOT_FOUND) || e_str.contains(ERROR_KEY_NOT_FOUND) {
+                return Ok(None);
+            }
+            error!("get Yandex LBS data from service: {}", e);
+            Err(e)
+        }
+        Ok(value) => {
+            // crud.go, row 972, return empty bulk-string:
+            // return resp.StringValue(""), nil
+            // alternative for ID_NOT_FOUND_ERROR
+            if value.is_empty() {
+                return Ok(None);
+            }
+
+            let ywm_str = String::from_utf8(value).unwrap();
+            let ywm: YandexWifiMissing = serde_json::from_str(&ywm_str).unwrap();
+            Ok(Some(ywm))
+        }
+    }
+}
+
 // very slow responses from Tile38
-#[allow(unused)]
-pub async fn get_wifi_many(
+pub async fn _get_wifi_many(
     mut connection: MultiplexedConnection,
     collection: &str,
     selected_macs: &[&str],

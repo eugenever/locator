@@ -4,7 +4,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_schedule::Job;
 
 use super::{T38ConnectionManageMessage, manage_master_replica};
-use crate::config::Config;
+use crate::config::CONFIG;
 
 // every aofshrink_frequency day(s) at two o'clock
 pub fn aofshrink_task(
@@ -40,13 +40,38 @@ pub fn gc_task(
     })
 }
 
-pub async fn get_conection(
+pub async fn get_connection(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
     error: Option<String>,
 ) -> Result<MultiplexedConnection, anyhow::Error> {
     let (tx, rx) = oneshot::channel();
     tx_t38_conn
         .send_async(T38ConnectionManageMessage::GetConnection { tx, error })
+        .await
+        .unwrap();
+
+    match rx
+        .await
+        .map_err(|err| anyhow::anyhow!("error receive tile38 master connection: {}", err))
+    {
+        Err(e) => Err(e),
+        Ok(v) => {
+            if let Some(c) = v {
+                Ok(c)
+            } else {
+                Err(anyhow::anyhow!("Tile38 connection not defined"))
+            }
+        }
+    }
+}
+
+pub async fn get_connection_service(
+    tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    error: Option<String>,
+) -> Result<MultiplexedConnection, anyhow::Error> {
+    let (tx, rx) = oneshot::channel();
+    tx_t38_conn
+        .send_async(T38ConnectionManageMessage::GetConnectionService { tx, error })
         .await
         .unwrap();
 
@@ -76,20 +101,22 @@ pub fn healthz_task(
                 if let Err(err) = crate::db::t38::healthz(tx_t38_conn.clone()).await {
                     error!("Healthz Tile38: {}", err);
                 }
+                if let Err(err) = crate::db::t38::healthz_service(tx_t38_conn.clone()).await {
+                    error!("Healthz Tile38 service: {}", err);
+                }
             })
             .await;
     })
 }
 
 pub async fn connection_manage_task(
-    config: &Config,
     rx: flume::Receiver<T38ConnectionManageMessage>,
     tx: flume::Sender<T38ConnectionManageMessage>,
 ) -> Result<JoinHandle<()>, anyhow::Error> {
-    if config.t38.instances.is_some() {
-        let res_jh = manage_master_replica(config, rx, tx).await;
+    if CONFIG.t38.instances.is_some() {
+        let res_jh = manage_master_replica(rx, tx).await;
         return res_jh;
-    } else if config.t38.sentinel.is_some() {
+    } else if CONFIG.t38.sentinel.is_some() {
         let jh = tokio::spawn(async {});
         return Ok(jh);
     }

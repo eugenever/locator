@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 
+use crate::constants::HC;
+
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     let path = Path::new("config.toml");
     let config = load_config(path);
@@ -16,7 +18,6 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     }
 });
 
-/// Rust representation of the configuration
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     /// Http server settings
@@ -35,12 +36,28 @@ pub struct Config {
     pub altergeo_lbs: AlterGeoLBS,
     /// Tile38 settings
     pub t38: T38,
+    /// Blobasaur settings
+    pub blobasaur: Blobasaur,
     /// GraphHopper settings
     pub graphhopper: GraphHopper,
 }
 
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        let hc = vec![HC::Reqwest.to_string(), HC::Surf.to_string()];
+        if !hc.contains(&self.locator.http_client) {
+            return Err(anyhow::anyhow!(
+                "unsupported http client: {}",
+                self.locator.http_client
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Locator {
+    pub http_client: String,
     /// queue size for saving reports to the database
     pub report_queue_size: usize,
     /// number of tasks processing reports
@@ -69,6 +86,10 @@ pub struct Database {
     pub report_number_days_search: u16,
     /// How many days should reports be kept
     pub report_keep_days: u16,
+    /// number of reports processed at a time
+    pub number_processed_reports: u32,
+    /// report processing by partitions
+    pub report_processing_by_partitions: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -100,9 +121,16 @@ pub struct Server {
 pub struct YandexLBS {
     pub enabled: bool,
     pub url: String,
-    pub api_keys: Vec<String>,
+    pub api_keys: Vec<YandexApiKey>,
+    pub reserve_limiter: u64,
     pub rate_limit: usize,
     pub max_distance_in_cluster: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct YandexApiKey {
+    pub key: String,
+    pub limit: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,7 +142,9 @@ pub struct AlterGeoLBS {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct T38 {
+    pub pool_size: u16,
     pub instances: Option<Vec<T38Instance>>,
+    pub service: Option<Vec<T38Instance>>,
     pub sentinel: Option<Vec<T38Sentinel>>,
     pub gc_frequency: Option<u32>,
     pub aofshrink_frequency: Option<u32>,
@@ -129,6 +159,14 @@ pub struct T38Instance {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct T38Sentinel {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Blobasaur {
+    pub enabled: bool,
+    pub pool_size: u16,
     pub host: String,
     pub port: u16,
 }
@@ -150,6 +188,7 @@ pub struct GraphHopperAdmin {
 
 pub fn load_config(path: &Path) -> Result<Config> {
     let data = fs::read_to_string(path).context("Failed to read config")?;
-    let config = toml::from_str(&data).context("Failed to parse config")?;
+    let config: Config = toml::from_str(&data).context("Failed to parse config")?;
+    config.validate()?;
     Ok(config)
 }

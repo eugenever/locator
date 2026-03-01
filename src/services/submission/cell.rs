@@ -4,11 +4,15 @@ use log::error;
 use crate::{
     error::create_error_response,
     lbs::{
+        http_client::HttpClient,
         model::{self, create_cell_measurement},
-        yandex_cell::yandex_lbs_request_by_individual_cell,
+        yandex::cell::yandex_lbs_request_by_individual_cell,
     },
     services::rate_limiter::RateLimitersApp,
-    tasks::{t38::T38ConnectionManageMessage, yandex::YandexApiMessage},
+    tasks::{
+        blobasaur::BAConnectionManageMessage, t38::T38ConnectionManageMessage,
+        yandex::YandexApiMessage,
+    },
 };
 
 /*
@@ -51,7 +55,7 @@ Yandex scheme:
 ]
 
 
-Locator scheme:
+Isone scheme:
 
 "cell": {
     "gsm": [
@@ -80,20 +84,29 @@ Locator scheme:
 pub async fn service(
     data: web::Json<model::Cell>,
     tx_t38_conn: web::Data<flume::Sender<T38ConnectionManageMessage>>,
+    tx_ba_conn: web::Data<flume::Sender<BAConnectionManageMessage>>,
     rl_app_web: web::Data<RateLimitersApp>,
-    yandex_client_web: web::Data<reqwest::Client>,
+    yandex_client_web: web::Data<HttpClient>,
     tx_yandex_api_web: web::Data<flume::Sender<YandexApiMessage>>,
     _req: HttpRequest,
 ) -> actix_web::Result<impl Responder> {
     let data = data.into_inner();
     let tx_t38c = (*tx_t38_conn.into_inner()).clone();
+    let tx_ba_c = (*tx_ba_conn.into_inner()).clone();
     let yandex_client = (*yandex_client_web.into_inner()).clone();
     let tx_yandex_api = (*tx_yandex_api_web.into_inner()).clone();
     let rl_app = (*rl_app_web.into_inner()).clone();
 
     let cms = create_cell_measurement(&data);
-    match yandex_lbs_request_by_individual_cell(tx_t38c, cms, yandex_client, tx_yandex_api, rl_app)
-        .await
+    match yandex_lbs_request_by_individual_cell(
+        tx_t38c,
+        tx_ba_c,
+        cms,
+        yandex_client,
+        tx_yandex_api,
+        rl_app,
+    )
+    .await
     {
         Err(e) => {
             error!("Yandex LBS request by individual cells: {}", e);

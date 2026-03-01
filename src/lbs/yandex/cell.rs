@@ -1,22 +1,25 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use super::model::{Cell, CellMeasurement};
 use crate::{
     config::CONFIG,
     constants::{Collection, RadioType},
-    db::t38::{get_yandex_lbs_cell_one, set_yandex_lbs_cell_one},
+    db::{blobasaur::get_ba_limiter, t38::get_yandex_lbs_cell_one},
     error::ApiError,
     lbs::{
+        http_client::HttpClient,
         model::{self, create_cell_measurement},
-        yandex::YandexLbsResponse,
+        yandex::{
+            cell::model::{Cell, CellMeasurement},
+            wifi::YandexLbsResponse,
+        },
     },
     services::rate_limiter::RateLimitersApp,
     tasks::{
+        blobasaur::BAConnectionManageMessage,
         t38::T38ConnectionManageMessage,
         yandex::{InvalidApiKey, YandexApiMessage},
     },
@@ -102,15 +105,16 @@ pub struct YandexCell {
 pub async fn get_cell(
     cell_opt: Option<Cell>,
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<Option<HashMap<String, Option<YandexLbsResponse>>>, ApiError> {
     if let Some(cell) = cell_opt {
         let cms = create_cell_measurement(&cell);
-
         match yandex_lbs_request_by_individual_cell(
             tx_t38_conn,
+            tx_ba_conn,
             cms,
             yandex_client,
             tx_yandex_api,
@@ -120,12 +124,10 @@ pub async fn get_cell(
         {
             Err(e) => {
                 error!("Yandex LBS request by individual cells: {}", e);
-                return Err(e);
+                Err(e)
             }
-            Ok(ylrs) => {
-                return Ok(Some(ylrs));
-            }
-        };
+            Ok(ylrs) => Ok(Some(ylrs)),
+        }
     } else {
         Ok(None)
     }
@@ -133,8 +135,9 @@ pub async fn get_cell(
 
 pub async fn yandex_lbs_request_by_individual_cell(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
     cms: Vec<CellMeasurement>,
-    yandex_client: reqwest::Client,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> Result<HashMap<String, Option<YandexLbsResponse>>, ApiError> {
@@ -142,6 +145,7 @@ pub async fn yandex_lbs_request_by_individual_cell(
         HashMap::with_capacity(cms.len());
 
     let collection = Collection::LbsYandexCell.as_ref();
+    let tz_moscow = chrono_tz::Europe::Moscow;
 
     for cm in cms {
         let mcc = cm.mcc;
@@ -192,108 +196,56 @@ pub async fn yandex_lbs_request_by_individual_cell(
         }
 
         if let Ok(Some(api_key)) = rx.await {
-            let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key);
+            if let Ok(limiter) = get_ba_limiter(tx_ba_conn.clone(), &api_key.key.key).await {
+                // DEBUG
+                // TODO: remove after tests by Whoosh
+                info!(
+                    "key {}, limiter: {}, limit: {}",
+                    api_key.key.key, limiter, api_key.key.limit
+                );
+
+                if limiter >= api_key.key.limit - CONFIG.yandex_lbs.reserve_limiter {
+                    // block the current API key
+                    let created_date = chrono::Utc::now().with_timezone(&tz_moscow).date_naive();
+                    let yandex_api_message_invalid_key = YandexApiMessage::InvalidApiKey {
+                        invalid_api_key: InvalidApiKey {
+                            _error: Some(format!("StatusCode {}", 403)),
+                            i: api_key.i,
+                            key: api_key.key,
+                            created_date,
+                        },
+                    };
+                    if let Err(e) = tx_yandex_api
+                        .send_async(yandex_api_message_invalid_key)
+                        .await
+                    {
+                        error!("send yandex api invalid key message: {}", e);
+                    }
+                    return Err(ApiError::LbsError(403));
+                }
+            }
+
+            let yandex_lbs_url = format!("{}{}", CONFIG.yandex_lbs.url, &api_key.key.key);
 
             // Acquire permit before processing request
             // Permit released automatically when the handler is completed
             let _permit = rl_app.yandex_lbs.acquire().await;
 
-            let count_attempts = 5;
-            let mut attempt = 0;
-            while attempt <= count_attempts {
-                attempt = attempt + 1;
-
-                match yandex_client
-                    .post(&yandex_lbs_url)
-                    .json(&yandex_lbs_request)
-                    .send()
-                    .await
-                {
-                    Err(e) => {
-                        // undefined request error
-                        error!("Yandex LBS request for cell code '{}': {}", &cell_code, e);
-                        return Err(ApiError::LbsRequestError());
-                    }
-                    Ok(response) => {
-                        // 400, 403, 429, 500, 504
-                        let status = response.status().as_u16();
-                        if status != 200 {
-                            // repeat the request in Yandex LBS
-                            if status == 429 || status == 500 || status == 504 {
-                                if attempt == count_attempts {
-                                    return Err(ApiError::LbsError(status));
-                                }
-                                info!(
-                                    "cell code: {}, status: {}, attempt: {}",
-                                    &cell_code, status, attempt
-                                );
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                            if status == 403 {
-                                info!("Yandex: number of requests has been exceeded");
-                                let yandex_api_message_invalid_key =
-                                    YandexApiMessage::InvalidApiKey {
-                                        invalid_api_key: InvalidApiKey {
-                                            error: Some(format!("StatusCode {}", status)),
-                                            i: api_key.i,
-                                            key: api_key.key,
-                                        },
-                                    };
-                                if let Err(e) = tx_yandex_api
-                                    .send_async(yandex_api_message_invalid_key)
-                                    .await
-                                {
-                                    error!("send yandex api invalid key message: {}", e);
-                                }
-                            }
-                            info!(
-                                "cell code: {}, Yandex response status: {}",
-                                &cell_code, status
-                            );
-                            return Err(ApiError::LbsError(status));
-                        }
-
-                        match response.json::<serde_json::Value>().await {
-                            Err(e) => {
-                                error!("deserialize Yandex LBS response: {}", e);
-                                lbs_responses.insert(cell_code.clone(), None);
-                            }
-                            Ok(value) => {
-                                // successful response
-                                if let serde_json::Value::Object(ref object) = value {
-                                    if object.is_empty() {
-                                        // no data available for the requested access point
-                                        lbs_responses.insert(cell_code.clone(), None);
-                                        // exit from while loop
-                                        break;
-                                    }
-                                }
-
-                                if let Ok(yandex_lbs_response) =
-                                    serde_json::from_value::<YandexLbsResponse>(value)
-                                {
-                                    let ylr = yandex_lbs_response.clone();
-                                    lbs_responses.insert(cell_code.clone(), Some(ylr));
-
-                                    // save Yandex LBS response in our database
-                                    if let Err(e) = set_yandex_lbs_cell_one(
-                                        tx_t38_conn.clone(),
-                                        collection,
-                                        yandex_lbs_response,
-                                        &cell_code,
-                                    )
-                                    .await
-                                    {
-                                        error!("save Yandex LBS response: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        // exit from while loop
-                        break;
-                    }
-                }
+            if let Err(e) = yandex_client
+                .post_for_data(
+                    &cell_code,
+                    &yandex_lbs_url,
+                    &yandex_lbs_request,
+                    tx_yandex_api.clone(),
+                    api_key,
+                    &mut lbs_responses,
+                    tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
+                    collection,
+                )
+                .await
+            {
+                return Err(e);
             }
         } else {
             return Err(ApiError::LbsError(403));
@@ -345,12 +297,12 @@ fn create_yandex_cell(cm: CellMeasurement) -> Option<YandexCell> {
     }
 }
 
-#[allow(unused)]
+#[cfg(test)]
 mod tests {
     use super::{YandexLbsRequestCell, YandexLbsResponse};
     use crate::{
         CONFIG,
-        lbs::{model::CellMeasurement, yandex_cell::create_yandex_cell},
+        lbs::{model::CellMeasurement, yandex::cell::create_yandex_cell},
     };
 
     /*
@@ -413,11 +365,11 @@ mod tests {
                             }
                             Ok(value) => {
                                 // successful response
-                                if let serde_json::Value::Object(ref object) = value {
-                                    if object.is_empty() {
-                                        // no data available for the requested access point
-                                        println!("empty object");
-                                    }
+                                if let serde_json::Value::Object(ref object) = value
+                                    && object.is_empty()
+                                {
+                                    // no data available for the requested access point
+                                    println!("empty object");
                                 }
 
                                 if let Ok(yandex_lbs_response) =

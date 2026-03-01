@@ -4,7 +4,7 @@ num_http_workers = 4 # number of Actix workers
 max_payload_mb = 50
 log_level = "info"
 creditional_tokens = [
-    "SECRET-TOKEN",
+    "ISONE-TOKEN",
     "axC7NmKh3NmQt5gvhNHEew2l8rKY9cGuUZsaq3b6WejVNzzk31J70yjlt2gOGYKz"
 ] # authorization token for the public API
 
@@ -13,6 +13,8 @@ max_connections_db = 25
 report_processing_frequency = 60 # frequency of processing reports from PostgreSQL, seconds
 report_number_days_search = 3 # report sampling depth, days
 report_keep_days = 180 # delete partitions after the specified number of days have passed
+number_processed_reports = 7
+report_processing_by_partitions = true
 
 [threadpool]
 core_size = 2 # minimum number of hot threads
@@ -20,16 +22,18 @@ max_size = 8 # maximum number of all threads
 keep_alive = 60 # lifetime of threads without load
 
 [locator]
+http_client = "surf"
 report_queue_size = 150000
 tasks_processing_reports_count = 4
 process_report_online = true
-radius_wifi_detection = 500
+radius_wifi_detection = 150
 h3_resolution = 8
-max_distance_in_cluster = 200 # meters
-max_distance_cell = 2500 # meters
+max_distance_in_cluster = 250 # meters
+max_distance_cell = 600 # meters
 laa_filter = false # filter Locally Administered Addresses
 
 [t38]
+pool_size = 5
 gc_frequency = 1800 # seconds
 aofshrink_frequency = 1 # day
 healthz_frequency = 1 # every second
@@ -37,18 +41,26 @@ instances = [
     { host = "127.0.0.1", port = 9851 },
     { host = "127.0.0.1", port = 9852 }
 ]
-# sentinel = [
-#     { host = "127.0.0.1", port = 26379 }
-# ]
+service = [
+    { host = "127.0.0.1", port = 9751 },
+    { host = "127.0.0.1", port = 9752 }
+]
+
+[blobasaur]
+enabled = true
+pool_size = 5
+host = "127.0.0.1"
+port = 7379
 
 [yandex-lbs]
 enabled = false
 url = "https://locator.api.maps.yandex.ru/v1/locate?apikey="
 api_keys = [
-    "b9da27e2-8440-4561-8a09-c0c9781410a1"
+    { key = "b9da27e2-8440-4561-8a09-c0c9781410a1", limit = 1000 }
 ]
+reserve_limiter = 10
 rate_limit = 10 # maximum number of simultaneous requests
-max_distance_in_cluster = 500
+max_distance_in_cluster = 250
 
 [altergeo-lbs]
 enabled = true

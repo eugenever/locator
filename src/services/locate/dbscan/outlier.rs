@@ -6,24 +6,28 @@ use log::error;
 use super::{Algorithm, DBSCAN, Point};
 use crate::{
     CONFIG,
-    db::transmitter::TransmitterLocation,
+    db::pg::transmitter::TransmitterLocation,
     error::ApiError,
-    lbs::yandex::{WifiMeasurement, YandexLbsResponse, yandex_lbs_request_by_individual_wifi},
+    lbs::{
+        http_client::HttpClient,
+        yandex::wifi::{WifiMeasurement, YandexLbsResponse, yandex_lbs_request_by_individual_wifi},
+    },
     services::rate_limiter::RateLimitersApp,
-    tasks::{t38::T38ConnectionManageMessage, yandex::YandexApiMessage},
+    tasks::{
+        blobasaur::BAConnectionManageMessage, t38::T38ConnectionManageMessage,
+        yandex::YandexApiMessage,
+    },
 };
 
-#[derive(Debug)]
 pub struct Outlier<'a> {
     pub mac: &'a str,
-    pub id: u32,
 }
 
 pub fn check_outlier(outliers_opt: Option<&Vec<Outlier<'_>>>, tl: &TransmitterLocation) -> bool {
-    if let Some(outliers) = outliers_opt {
-        if outliers.iter().any(|otl| otl.mac == tl.mac) {
-            return true;
-        }
+    if let Some(outliers) = outliers_opt
+        && outliers.iter().any(|otl| otl.mac == tl.mac)
+    {
+        return true;
     }
     false
 }
@@ -31,16 +35,13 @@ pub fn check_outlier(outliers_opt: Option<&Vec<Outlier<'_>>>, tl: &TransmitterLo
 pub async fn detect_outliers(
     tls: &[Option<TransmitterLocation>],
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
     cell_opt: Option<HashMap<String, Option<YandexLbsResponse>>>,
 ) -> Result<Option<Vec<Outlier<'_>>>, ApiError> {
-    let tls_filtered = tls
-        .iter()
-        .filter(|&tl| tl.is_some())
-        .map(|t| t.as_ref().unwrap())
-        .collect::<Vec<_>>();
+    let tls_filtered = tls.iter().filter_map(|t| t.as_ref()).collect::<Vec<_>>();
 
     let cap = tls_filtered.len();
     let mut points = Vec::with_capacity(cap);
@@ -58,6 +59,7 @@ pub async fn detect_outliers(
 
     let cell = cell_opt.unwrap_or_default();
     let cell_points = create_cell_points(&cell);
+    let dfc = distance_factor_cell(&cell);
 
     if points.len() == 1 {
         if CONFIG.yandex_lbs.enabled {
@@ -65,26 +67,25 @@ pub async fn detect_outliers(
 
             // first filter by BS service area
             // for one point this filter can be allocated to a separate block
-            if cell_points.len() > 0 {
+            if !cell_points.is_empty() {
                 let distance_point_cell = points[0].distance(&cell_points[0]);
-                if distance_point_cell > CONFIG.locator.max_distance_cell {
+                if distance_point_cell > CONFIG.locator.max_distance_cell * dfc {
                     noise.push(Outlier {
-                        id: 0,
                         mac: &tls_filtered[0].mac,
                     });
                     return Ok(Some(noise));
                 }
             }
 
-            let mut wms = vec![WifiMeasurement {
+            let wms = vec![WifiMeasurement {
                 bssid: tls_filtered[0].mac.clone(),
                 signal_strength: -70.0, // does not affect the result
             }];
 
             match yandex_lbs_request_by_individual_wifi(
                 tx_t38_conn,
-                &CONFIG,
-                wms,
+                tx_ba_conn,
+                &wms,
                 yandex_client.clone(),
                 tx_yandex_api,
                 rl_app,
@@ -96,26 +97,23 @@ pub async fn detect_outliers(
                     return Err(e);
                 }
                 Ok(yandex_lbs_responses) => {
-                    if let Some(ylr_opt) = yandex_lbs_responses.get(&tls_filtered[0].mac) {
-                        if let Some(ylr) = ylr_opt {
-                            let yandex_point = Point {
-                                id: 0,
-                                lat: ylr.location.point.lat,
-                                lon: ylr.location.point.lon,
-                            };
-                            let distance = yandex_point.distance(&points[0]);
-                            // second filter is based on the distance between our point and Yandex's point
-                            if distance > 2.0 * CONFIG.locator.max_distance_in_cluster {
-                                // can't tell which data has an error: ours or Yandex's
-                                // add point to outlier
-                                noise.push(Outlier {
-                                    id: yandex_point.id,
-                                    mac: &tls_filtered[0].mac,
-                                });
-                            }
+                    if let Some(Some(ylr)) = yandex_lbs_responses.get(&tls_filtered[0].mac) {
+                        let yandex_point = Point {
+                            id: 0,
+                            lat: ylr.location.point.lat,
+                            lon: ylr.location.point.lon,
+                        };
+                        let distance = yandex_point.distance(&points[0]);
+                        // second filter is based on the distance between our point and Yandex's point
+                        if distance > CONFIG.locator.max_distance_in_cluster {
+                            // can't tell which data has an error: ours or Yandex's
+                            // add point to outlier
+                            noise.push(Outlier {
+                                mac: &tls_filtered[0].mac,
+                            });
                         }
                     }
-                    if noise.len() > 0 {
+                    if !noise.is_empty() {
                         return Ok(Some(noise));
                     }
                 }
@@ -139,8 +137,8 @@ pub async fn detect_outliers(
 
             match yandex_lbs_request_by_individual_wifi(
                 tx_t38_conn,
-                &CONFIG,
-                wms,
+                tx_ba_conn,
+                &wms,
                 yandex_client.clone(),
                 tx_yandex_api,
                 rl_app,
@@ -162,25 +160,24 @@ pub async fn detect_outliers(
                             if let Some(index_mac) = macs.iter().position(|m| m.contains(&mac)) {
                                 let distance = yandex_point.distance(&points[index_mac]);
                                 let mut distance_point_cell = 0.0;
-                                if cell_points.len() > 0 {
+                                if !cell_points.is_empty() {
                                     distance_point_cell =
                                         points[index_mac].distance(&cell_points[0]);
                                 }
 
-                                if distance > 2.0 * CONFIG.locator.max_distance_in_cluster
-                                    || distance_point_cell > CONFIG.locator.max_distance_cell
+                                if distance > CONFIG.locator.max_distance_in_cluster
+                                    || distance_point_cell > CONFIG.locator.max_distance_cell * dfc
                                 {
                                     // can't tell which data has an error: ours or Yandex's
                                     // add point to outlier
                                     noise.push(Outlier {
-                                        id: yandex_point.id,
                                         mac: &tls_filtered[index_mac].mac,
                                     });
                                 }
                             }
                         }
                     }
-                    if noise.len() > 0 {
+                    if !noise.is_empty() {
                         return Ok(Some(noise));
                     } else {
                         // the minimum number of points in a cluster must be greater than 1
@@ -188,16 +185,12 @@ pub async fn detect_outliers(
                         let algorithm =
                             DBSCAN::new(CONFIG.locator.max_distance_in_cluster, min_pts);
                         let clusters = algorithm.cluster(&points);
-                        let actual_clusters = clusters.clusters();
                         let cluster_noise = clusters.noise();
-                        if cluster_noise.len() > 0 {
+                        if !cluster_noise.is_empty() {
                             let mut outliers = Vec::with_capacity(noise.len());
                             cluster_noise.into_iter().for_each(|p| {
                                 if let Some(&tl) = tls_filtered.get(p.id as usize) {
-                                    let outlier = Outlier {
-                                        id: p.id,
-                                        mac: &tl.mac,
-                                    };
+                                    let outlier = Outlier { mac: &tl.mac };
                                     outliers.push(outlier);
                                 }
                             });
@@ -212,30 +205,33 @@ pub async fn detect_outliers(
 
     let mut discarded_by_cell_points = Vec::new();
     let mut filtered_by_cell_points = Vec::new();
-    if cell_points.len() > 0 {
+    if !cell_points.is_empty() {
         points.iter().for_each(|p| {
             let distance_point_cell = p.distance(&cell_points[0]);
-            if distance_point_cell > CONFIG.locator.max_distance_cell {
-                discarded_by_cell_points.push(p.clone());
+            if distance_point_cell > CONFIG.locator.max_distance_cell * dfc {
+                discarded_by_cell_points.push(*p);
             } else {
-                filtered_by_cell_points.push(p.clone());
+                filtered_by_cell_points.push(*p);
             }
         });
-
-        // all points outside the BS service area
-        // TODO: incorrect base station coordinates?
-        if discarded_by_cell_points.len() > 0 && discarded_by_cell_points.len() == points.len() {
-            filtered_by_cell_points = points;
-            discarded_by_cell_points.clear();
-        }
     } else {
         filtered_by_cell_points = points;
     }
 
     let algorithm = DBSCAN::new(CONFIG.locator.max_distance_in_cluster, 0);
     let clusters = algorithm.cluster(&filtered_by_cell_points);
-    let actual_clusters = clusters.clusters();
-    let mut noise = clusters.noise();
+
+    let fp_len = filtered_by_cell_points.len();
+    let actual_clusters = if fp_len == 1 {
+        vec![filtered_by_cell_points]
+    } else {
+        clusters.clusters()
+    };
+    let mut noise = if fp_len == 1 {
+        vec![]
+    } else {
+        clusters.noise()
+    };
 
     // add points discarded by BS
     noise.append(&mut discarded_by_cell_points);
@@ -259,16 +255,13 @@ pub async fn detect_outliers(
         }
     }
 
-    if noise.len() == 0 {
+    if noise.is_empty() {
         Ok(None)
     } else {
         let mut outliers = Vec::with_capacity(noise.len());
         noise.into_iter().for_each(|p| {
             if let Some(&tl) = tls_filtered.get(p.id as usize) {
-                let outlier = Outlier {
-                    id: p.id,
-                    mac: &tl.mac,
-                };
+                let outlier = Outlier { mac: &tl.mac };
                 outliers.push(outlier);
             }
         });
@@ -278,15 +271,25 @@ pub async fn detect_outliers(
 
 pub fn create_cell_points(cell: &HashMap<String, Option<YandexLbsResponse>>) -> Vec<Point> {
     let mut cell_points = Vec::with_capacity(cell.len());
-    for (cell_code, cell_ylr_opt) in cell {
-        if let Some(cell_ylr) = cell_ylr_opt {
-            let cell_point = Point {
-                id: 0,
-                lat: cell_ylr.location.point.lat,
-                lon: cell_ylr.location.point.lon,
-            };
-            cell_points.push(cell_point);
-        }
+    for cell_ylr in cell.values().flatten() {
+        let cell_point = Point {
+            id: 0,
+            lat: cell_ylr.location.point.lat,
+            lon: cell_ylr.location.point.lon,
+        };
+        cell_points.push(cell_point);
     }
     cell_points
+}
+
+pub fn distance_factor_cell(cell: &HashMap<String, Option<YandexLbsResponse>>) -> f64 {
+    // default factor for LTE = 1.0
+    let mut factor = 1.0;
+    if let Some(key) = cell.keys().next()
+        && key.contains("gsm")
+    {
+        // for GSM double the distance
+        factor = 1.0;
+    }
+    factor
 }

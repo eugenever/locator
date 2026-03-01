@@ -1,20 +1,25 @@
 #![allow(unused)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use geo::{Destination, Point, Rhumb};
 use log::{error, info};
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_schedule::Job;
 
 use crate::{
     CONFIG,
-    constants::{BASE_RSSI, SIGNAL_DROP_COEFFICIENT},
+    constants::{BASE_RSSI, DEFAULT_RSSI, SIGNAL_DROP_COEFFICIENT},
     db::{
-        bulk_insert::{DataReport, bulk_insert_data},
         model::Transmitter,
-        transmitter::TransmitterLocation,
+        pg::{
+            RangeId,
+            bulk_insert::{DataReport, bulk_insert_data},
+            get_range_id_for_report,
+            transmitter::TransmitterLocation,
+        },
     },
+    lbs::http_client::HttpClient,
     services::{
         helper::{
             custom_deserialize::{default_timestamp, default_timestamp_ms},
@@ -28,13 +33,17 @@ use crate::{
             report::{Report as ReportProcess, extract_from_report},
         },
     },
-    tasks::{t38::T38ConnectionManageMessage, yandex::YandexApiMessage},
+    tasks::{
+        blobasaur::BAConnectionManageMessage, t38::T38ConnectionManageMessage,
+        yandex::YandexApiMessage,
+    },
 };
 
 pub fn process_reports_task(
     pool_tp: deadpool_postgres::Pool,
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
 ) -> JoinHandle<()> {
@@ -42,12 +51,15 @@ pub fn process_reports_task(
         tokio_schedule::every(CONFIG.database.report_processing_frequency)
             .seconds()
             .perform(|| async {
+                let geo_fence = None;
                 if let Err(err) = submission::process::run(
                     pool_tp.clone(),
                     tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
                     yandex_client.clone(),
                     tx_yandex_api.clone(),
                     rl_app.clone(),
+                    geo_fence,
                 )
                 .await
                 {
@@ -60,7 +72,8 @@ pub fn process_reports_task(
 
 pub fn online_process_report_task(
     tx_t38_conn: flume::Sender<T38ConnectionManageMessage>,
-    yandex_client: reqwest::Client,
+    tx_ba_conn: flume::Sender<BAConnectionManageMessage>,
+    yandex_client: HttpClient,
     tx_yandex_api: flume::Sender<YandexApiMessage>,
     rl_app: RateLimitersApp,
     rx_report: flume::Receiver<MessageSaveReport>,
@@ -75,6 +88,7 @@ pub fn online_process_report_task(
                 match extract_from_report(
                     report,
                     tx_t38_conn.clone(),
+                    tx_ba_conn.clone(),
                     yandex_client.clone(),
                     tx_yandex_api.clone(),
                     rl_app.clone(),
@@ -86,7 +100,7 @@ pub fn online_process_report_task(
                             BTreeMap::new();
 
                         for transmitter in transmitters {
-                            let rssi = transmitter.signal_strength().unwrap_or(-90.0);
+                            let rssi = transmitter.signal_strength().unwrap_or(DEFAULT_RSSI);
 
                             let distance_since_scan;
                             let lat;
@@ -115,11 +129,11 @@ pub fn online_process_report_task(
                                 lon = pos.longitude;
                             };
 
-                            let distance_from_transmitter = 10_f64
-                                .powf((BASE_RSSI - rssi as f64) / (10.0 * SIGNAL_DROP_COEFFICIENT));
+                            let distance_from_transmitter =
+                                10_f64.powf((BASE_RSSI - rssi) / (10.0 * SIGNAL_DROP_COEFFICIENT));
 
                             let signal_weight =
-                                10_f64.powf(rssi as f64 / (10.0 * SIGNAL_DROP_COEFFICIENT));
+                                10_f64.powf(rssi / (10.0 * SIGNAL_DROP_COEFFICIENT));
 
                             let age_weight = 10_f64.powf(-distance_since_scan.abs() / 25.0);
 
@@ -214,7 +228,7 @@ pub fn save_report_task(
     rx_save_report: flume::Receiver<MessageSaveReport>,
     pool_tokio_task: pool_task::Pool,
 ) -> JoinHandle<()> {
-    let batch_size = 500 as usize;
+    let batch_size = 500;
     let timeout_insert = 60; // seconds
     let mut buffer = Vec::with_capacity(batch_size);
 
@@ -260,7 +274,7 @@ pub fn save_report_task(
                 }
                 // timeout has occurred, we are forcing a write to the PostgreSQL
                 Err(_err) => {
-                    if buffer.len() > 0 {
+                    if !buffer.is_empty() {
                         match bulk_insert_data(&pool_tp, &buffer, 500).await {
                             Err(e) => {
                                 error!("bulk insert: {}", e);
@@ -282,14 +296,100 @@ pub fn process_report_partitions_task(pool_tp: deadpool_postgres::Pool) -> JoinH
             .day()
             .at(4, 0, 0)
             .perform(|| async {
-                if let Err(err) = crate::db::create_partitions(pool_tp.clone()).await {
+                if let Err(err) = crate::db::pg::create_partitions(pool_tp.clone()).await {
                     error!("create 'report' partitions: {}", err);
                 }
-                if let Err(err) = crate::db::remove_partitions(pool_tp.clone()).await {
+                if let Err(err) = crate::db::pg::remove_partitions(pool_tp.clone()).await {
                     error!("remove 'report' partitions: {}", err);
                 }
                 info!("Successful processing of 'report' partitions");
             })
             .await;
+    })
+}
+
+pub enum MessageServicePartition {
+    RangeId {
+        partition: String,
+        tx: oneshot::Sender<Option<RangeId>>,
+    },
+    LastId {
+        partition: String,
+        tx: oneshot::Sender<Option<i64>>,
+    },
+    SetLastId {
+        partition: String,
+        id: i64,
+    },
+}
+
+pub fn service_report_partitions_task(
+    pool_tp: deadpool_postgres::Pool,
+    rx: flume::Receiver<MessageServicePartition>,
+) -> JoinHandle<()> {
+    let mut ranges_id: HashMap<String, RangeId> = HashMap::new();
+    let mut lasts_id: HashMap<String, i64> = HashMap::new();
+
+    tokio::spawn(async move {
+        while let Ok(message) = rx.recv_async().await {
+            match message {
+                MessageServicePartition::RangeId { partition, tx } => {
+                    if let Some(range) = ranges_id.get(&partition) {
+                        if let Err(_) = tx.send(Some(*range)) {
+                            error!("send RangeId: {:?} for partition {}", range, partition);
+                        }
+                    } else {
+                        match get_range_id_for_report(pool_tp.clone(), &partition).await {
+                            Err(e) => {
+                                error!("get range id for partition '{}': {}", partition, e);
+                                if let Err(_) = tx.send(None) {
+                                    error!("send RangeId for partition {}", partition);
+                                }
+                            }
+                            Ok(range) => {
+                                if let Some(r) = range.first() {
+                                    ranges_id.insert(partition.clone(), *r);
+                                    if let Err(_) = tx.send(Some(*r)) {
+                                        error!(
+                                            "send RangeId: {:?} for partition {}",
+                                            range, partition
+                                        );
+                                    }
+                                } else {
+                                    if let Err(_) = tx.send(None) {
+                                        error!("send RangeId for partition {}", partition);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                MessageServicePartition::LastId { partition, tx } => {
+                    if let Some(lid) = lasts_id.get(&partition) {
+                        if let Err(_) = tx.send(Some(*lid)) {
+                            error!("send last Id {} for partition {}", lid, partition);
+                        }
+                    } else {
+                        match get_range_id_for_report(pool_tp.clone(), &partition).await {
+                            Err(e) => {
+                                error!("get range id for partition '{}': {}", partition, e);
+                                if let Err(_) = tx.send(None) {
+                                    error!("send RangeId for partition {}", partition);
+                                }
+                            }
+                            Ok(range) => {
+                                if let Some(r) = range.first() {
+                                    ranges_id.insert(partition.clone(), *r);
+                                    lasts_id.insert(partition, r.min_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                MessageServicePartition::SetLastId { partition, id } => {
+                    lasts_id.insert(partition, id);
+                }
+            }
+        }
     })
 }

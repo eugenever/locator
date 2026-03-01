@@ -10,10 +10,15 @@ use crate::{CONFIG, services::rate_limiter::RateLimitersApp};
 
 curl -X POST \
 -H "Content-Type: application/gpx+xml" \
--H "Authorization: Bearer SECRET-TOKEN" \
+-H "Authorization: Bearer ISONE-TOKEN" \
 -d @test.gpx \
 "http://localhost:8080/api/v1/match?profile=bike&type=json&instructions=false&gps_accuracy=50&points_encoded=true"
 
+curl -X POST \
+-H "Content-Type: application/gpx+xml" \
+-H "Authorization: Bearer axC7NmKh3NmQt5gvhNHEew2l8rKY9cGuUZsaq3b6WejVNzzk31J70yjlt2gOGYKz" \
+-d @test.gpx \
+"https://locatro.isone.com/api/v1/match?profile=car_balanced&type=json&instructions=false&gps_accuracy=50&points_encoded=true"
 
 */
 
@@ -38,8 +43,8 @@ pub async fn service(
             let mut buffer: Vec<u8> = Vec::new();
             match gpx::write(&gpx_data, &mut buffer) {
                 Err(err) => {
-                    error!("write data to gpx: {}", err.to_string());
-                    return Ok(HttpResponse::InternalServerError().json(json!(
+                    error!("write data to gpx: {}", err);
+                    Ok(HttpResponse::InternalServerError().json(json!(
                         {
                             "error": {
                                 "domain": "match",
@@ -48,7 +53,7 @@ pub async fn service(
                                 "code": 500,
                             }
                         }
-                    )));
+                    )))
                 }
                 Ok(_) => {
                     let gh_response = match gh_match_request(buffer, params.into_inner()).await {
@@ -73,42 +78,36 @@ pub async fn service(
                     }
 
                     match gh_response.paths.first() {
-                        None => {
-                            return Ok(HttpResponse::NotFound().json(json!(
-                                {
-                                    "error": {
-                                        "domain": "match",
-                                        "reason": "Path not found",
-                                        "message": "Path not found",
-                                        "code": 404,
-                                    }
+                        None => Ok(HttpResponse::NotFound().json(json!(
+                            {
+                                "error": {
+                                    "domain": "match",
+                                    "reason": "Path not found",
+                                    "message": "Path not found",
+                                    "code": 404,
                                 }
-                            )));
-                        }
+                            }
+                        ))),
                         Some(path) => match &path.points {
                             // encoded geometry
                             serde_json::Value::String(s) => match polyline::decode_polyline(s, 5) {
-                                Err(err) => {
-                                    return Ok(HttpResponse::InternalServerError().json(json!(
-                                        {
-                                            "error": {
-                                                "domain": "match",
-                                                "reason": "Error decode polyline",
-                                                "message": err.to_string(),
-                                                "code": 500,
-                                            }
+                                Err(err) => Ok(HttpResponse::InternalServerError().json(json!(
+                                    {
+                                        "error": {
+                                            "domain": "match",
+                                            "reason": "Error decode polyline",
+                                            "message": err.to_string(),
+                                            "code": 500,
                                         }
-                                    )));
-                                }
-                                Ok(_line) => {
-                                    return Ok(HttpResponse::Ok().json(json!(
-                                        {
-                                            "geometry_encoded": path.points,
-                                            "bbox": path.bbox,
-                                            "distance": path.distance
-                                        }
-                                    )));
-                                }
+                                    }
+                                ))),
+                                Ok(_line) => Ok(HttpResponse::Ok().json(json!(
+                                    {
+                                        "geometry_encoded": path.points,
+                                        "bbox": path.bbox,
+                                        "distance": path.distance
+                                    }
+                                ))),
                             },
                             // geometry as LineString
                             serde_json::Value::Object(_) => {
@@ -130,17 +129,17 @@ pub async fn service(
                                     }
                                     Ok(geometry) => geometry,
                                 };
-                                return Ok(HttpResponse::Ok().json(json!(
+                                Ok(HttpResponse::Ok().json(json!(
                                     {
                                         "geometry": g,
                                         "bbox": path.bbox,
                                         "distance": path.distance
                                     }
-                                )));
+                                )))
                             }
                             _ => {
                                 error!("Unsupported type geometry");
-                                return Ok(HttpResponse::InternalServerError().json(json!(
+                                Ok(HttpResponse::InternalServerError().json(json!(
                                     {
                                         "error": {
                                             "domain": "match",
@@ -149,7 +148,7 @@ pub async fn service(
                                             "code": 500,
                                         }
                                     }
-                                )));
+                                )))
                             }
                         },
                     }
@@ -158,7 +157,7 @@ pub async fn service(
         }
         Err(err) => {
             error!("Can`t convert request body into gpx {:?}", err);
-            return Ok(HttpResponse::BadRequest().json(json!(
+            Ok(HttpResponse::BadRequest().json(json!(
                 {
                     "error": {
                         "domain": "match",
@@ -167,7 +166,7 @@ pub async fn service(
                         "code": 400,
                     }
                 }
-            )));
+            )))
         }
     }
 }

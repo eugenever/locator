@@ -9,6 +9,7 @@ pub fn round(x: f64, decimals: u32) -> f64 {
     (x * y).round() / y
 }
 
+#[allow(unused)]
 pub fn determine_thread_num() -> usize {
     let cpu_cores = num_cpus::get();
     std::cmp::max(1, cpu_cores - 1)

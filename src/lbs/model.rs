@@ -3,6 +3,8 @@ use serde_with::skip_serializing_none;
 
 use crate::constants::RadioType;
 
+pub static ALLOWED_MCC: [u16; 1] = [250];
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Cell {
@@ -130,4 +132,39 @@ pub fn create_cell_measurement(cell: &Cell) -> Vec<CellMeasurement> {
         }
     }
     cms
+}
+
+pub fn valid_cell(cell: Option<&Cell>) -> bool {
+    if let Some(c) = cell {
+        if let Some(lv) = &c.lte
+            && let Some(l) = lv.first()
+            && ALLOWED_MCC.contains(&l.mcc)
+        {
+            return true;
+        }
+
+        if let Some(gv) = &c.gsm
+            && let Some(g) = gv.first()
+            && ALLOWED_MCC.contains(&g.mcc)
+        {
+            return true;
+        }
+
+        if let Some(wv) = &c.wcdma
+            && let Some(w) = wv.first()
+            && ALLOWED_MCC.contains(&w.mcc)
+        {
+            return true;
+        }
+
+        if let Some(nv) = &c.nr
+            && let Some(n) = nv.first()
+            && ALLOWED_MCC.contains(&n.mcc)
+        {
+            return true;
+        }
+
+        return false;
+    }
+    return true;
 }
